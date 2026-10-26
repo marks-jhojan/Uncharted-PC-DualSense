@@ -1,0 +1,407 @@
+From 375821b8c98784a63b93ab66b43389a7e58b2db3 Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 2/8] runtime: UNDS_LED, UNDS_TRIGGER and physical trigger
+ travel in pad events
+
+Three switches for a companion that drives the DualSense directly
+(adaptive triggers and light bar through DSX now, through SDL later):
+
+  UNDS_LED=0              scePadSetLightBar / ResetLightBar no longer reach
+                          SDL_SetGamepadLED; the "led" event is still
+                          published. Two writers of the DualSense output
+                          report (SDL in the port and the companion's
+                          driver) would otherwise overwrite each other's
+                          light bar colour.
+  UNDS_TRIGGER=<l2>,<r2>  press threshold of L2 / R2 on the 0-255 travel
+                          (default 30,30, the value sample_host() had
+                          hard-coded). The port gives the game 0 or 255
+                          for a trigger, so this is where the shot
+                          happens; with an adaptive "weapon" effect it
+                          can be moved to the point where the trigger
+                          breaks.
+  pad l2a r2a             physical L2/R2 travel of the host sample (before
+                          the threshold), same deadband and 8 ms limit as
+                          the sticks: lets the companion calibrate effect
+                          zones against the threshold.
+
+All three work with or without UNDS_EVENTS; with none of them set the
+runtime behaves as before and prints nothing. hello gains led and trig.
+Protocol stays 1 (fields only added); UNDS_VERSION 0.3.0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RC6GzFSswtCVm6po4qo47t
+---
+ src/runtime_pad.c  | 24 ++++++++++++-----
+ src/runtime_unds.c | 66 +++++++++++++++++++++++++++++++++++++++-------
+ src/runtime_unds.h | 22 ++++++++++++----
+ tests/test_unds.c  | 50 +++++++++++++++++++++++++----------
+ 4 files changed, 126 insertions(+), 36 deletions(-)
+
+diff --git a/src/runtime_pad.c b/src/runtime_pad.c
+index f24b09d..96de146 100644
+--- a/src/runtime_pad.c
++++ b/src/runtime_pad.c
+@@ -74,6 +74,9 @@ static uint8_t connected_count;
+ static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+ static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+ static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
++/* UNDS: physical L2/R2 travel (0-255) of the last host sample, before the press threshold and
++ * the 255 the game is given for a pressed trigger. Written and read under `lock`. */
++static uint8_t host_trigger[2];
+ static uint16_t touch_axis(float v, int max) {
+     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
+ }
+@@ -808,6 +811,7 @@ static int prompts_pad_device(SDL_Gamepad *g) {
+ 
+ static void sample_host(PadData *d) {
+     memset(d,0,sizeof(*d));
++    host_trigger[0]=host_trigger[1]=0;
+     d->left_x=d->left_y=d->right_x=d->right_y=128;
+     d->orientation[3]=1.0f;
+     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
+@@ -840,12 +844,14 @@ static void sample_host(PadData *d) {
+             else if (b==PAD_TRIGGER_LEFT || b==PAD_TRIGGER_RIGHT) {
+                 const uint8_t v=trigger(SDL_GetGamepadAxis(g,b==PAD_TRIGGER_LEFT ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                                                               : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+-                if (v>30) d->buttons|=actions[a].ps;
++                if (v>runtime_unds_trigger_threshold(b==PAD_TRIGGER_RIGHT)) d->buttons|=actions[a].ps; /* 30 unless UNDS_TRIGGER */
+                 if (actions[a].ps==BTN_L2 && v>d->l2) d->l2=v;
+                 if (actions[a].ps==BTN_R2 && v>d->r2) d->r2=v;
+             }
+         }
+         if (SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_TOUCHPAD)) d->buttons|=BTN_TOUCHPAD; /* DualSense/DS4 click */
++        host_trigger[0]=trigger(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
++        host_trigger[1]=trigger(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+         if ((d->buttons & BTN_L2) && !d->l2) d->l2=255;
+         if ((d->buttons & BTN_R2) && !d->r2) d->r2=255;
+         d->left_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)); d->left_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY));
+@@ -1114,9 +1120,11 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
+     if (!data) return ERR_INVALID_ARG;
+     pthread_mutex_lock(&lock);
+     sample(data); ++reads;
++    const uint8_t l2_travel=host_trigger[0], r2_travel=host_trigger[1];
+     pthread_mutex_unlock(&lock);
+     /* UNDS: the state the game just read; published outside `lock` (data is the caller's buffer). */
+-    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2);
++    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2,
++                     l2_travel,r2_travel);
+     return 0;
+ }
+ /* Buffered read: the port samples once per call, so one entry is returned. */
+@@ -1159,11 +1167,13 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
+ }
+ /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
+ static void set_led(uint8_t r, uint8_t g, uint8_t b) {
+-    pthread_mutex_lock(&lock);
+-    SDL_Gamepad *pad=current_gamepad();
+-    if (pad) SDL_SetGamepadLED(pad,r,g,b);
+-    pthread_mutex_unlock(&lock);
+-    runtime_unds_led(r,g,b);
++    if (runtime_unds_led_enabled()) {
++        pthread_mutex_lock(&lock);
++        SDL_Gamepad *pad=current_gamepad();
++        if (pad) SDL_SetGamepadLED(pad,r,g,b);
++        pthread_mutex_unlock(&lock);
++    }
++    runtime_unds_led(r,g,b); /* UNDS: published also with UNDS_LED=0 */
+ }
+ static ABI int32_t pad_light_bar(int32_t handle, const uint8_t *rgb) {
+     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+diff --git a/src/runtime_unds.c b/src/runtime_unds.c
+index f84c222..98f9c4d 100644
+--- a/src/runtime_unds.c
++++ b/src/runtime_unds.c
+@@ -20,12 +20,14 @@
+  *
+  * Events (fields after v, seq, t, e):
+  *   hello  boot(1 first, 0 heartbeat) exe(u1 u2 u3 or file) bin pid base("0x...") ver up(ms)
+- *          rumble(1 SDL rumble on) sent drop err smax(longest sendto since last hello, us)
++ *          rumble(1 SDL rumble on) led(1 SDL light bar on) trig("l2,r2" press thresholds)
++ *          sent drop err smax(longest sendto since last hello, us)
+  *          vib(scePadSetVibration calls) ports("id:type:channels:frames,...")
+  *   bye    reason
+  *   rumble l s (0-255) re(1 refresh)
+  *   led    r g b re(1 refresh)
+- *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255)
++ *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255, what the game read;
++ *          the port gives 0 or 255 for the triggers) l2a r2a (physical trigger travel 0-255)
+  *   aopen  p(port) ty(type) ch fr(frames per buffer)
+  *   audio  p ty f(first frame of the window, port timeline) n(frames) rms pk lf
+  *          levels x10000 of full scale over the window: rms of L/R (8 channels folded like the
+@@ -67,12 +69,15 @@ typedef SOCKET unds_socket_t;
+ #define AUDIO_WINDOW 512       /* frames per audio event: 10.67 ms at 48 kHz */
+ #define PAD_MIN_INTERVAL_US 8000
+ #define STICK_DEADBAND 2
++#define TRIGGER_THRESHOLD_DEFAULT 30   /* runtime_pad.c sample_host() before UNDS_TRIGGER */
+ #define HEARTBEAT_TICK_NS 250000000u
+ #define SLOW_SEND_NS 1000000u
+ 
+ static _Atomic int active;     /* sending */
+ static _Atomic int configured; /* UNDS_EVENTS was set (the report prints) */
+ static _Atomic int rumble_on=1;
++static _Atomic int led_on=1;
++static _Atomic int trigger_threshold[2]={TRIGGER_THRESHOLD_DEFAULT,TRIGGER_THRESHOLD_DEFAULT};
+ static _Atomic int bye_done;
+ static unds_socket_t sock=UNDS_INVALID_SOCKET;
+ static struct sockaddr_in destination;
+@@ -86,7 +91,7 @@ static unsigned long process_id;
+ static char exe_id[16], exe_file[64];
+ 
+ static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
+-typedef struct { uint32_t b; uint8_t a[6]; } PadState; /* lx ly rx ry l2 r2 */
++typedef struct { uint32_t b; uint8_t a[8]; } PadState; /* lx ly rx ry l2 r2 l2a r2a */
+ static PadState pad_sent, pad_now;
+ static int pad_valid, pad_pending;
+ static uint64_t pad_sent_us;
+@@ -222,18 +227,20 @@ static void send_hello(int boot) {
+     pthread_mutex_unlock(&state_lock);
+     const uint64_t smax=atomic_exchange_explicit(&send_max_ns,0,memory_order_relaxed);
+     emit("hello",",\"boot\":%d,\"exe\":\"%s\",\"bin\":\"%s\",\"pid\":%lu,\"base\":\"0x%" PRIxPTR "\",\"ver\":\"%s\","
+-         "\"up\":%" PRIu64 ",\"rumble\":%d,\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
++         "\"up\":%" PRIu64 ",\"rumble\":%d,\"led\":%d,\"trig\":\"%d,%d\",\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
+          "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"",
+          boot,exe_id,exe_file,process_id,image_base,UNDS_VERSION,(now_us()-start_us)/1000u,
+-         atomic_load_explicit(&rumble_on,memory_order_relaxed),
++         atomic_load_explicit(&rumble_on,memory_order_relaxed),atomic_load_explicit(&led_on,memory_order_relaxed),
++         atomic_load_explicit(&trigger_threshold[0],memory_order_relaxed),
++         atomic_load_explicit(&trigger_threshold[1],memory_order_relaxed),
+          atomic_load_explicit(&sent,memory_order_relaxed),atomic_load_explicit(&dropped,memory_order_relaxed),
+          atomic_load_explicit(&errors,memory_order_relaxed),smax/1000u,
+          atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports);
+ }
+ 
+ static void send_pad(const PadState *s) {
+-    emit("pad",",\"b\":%" PRIu32 ",\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"l2\":%u,\"r2\":%u",
+-         s->b,s->a[0],s->a[1],s->a[2],s->a[3],s->a[4],s->a[5]);
++    emit("pad",",\"b\":%" PRIu32 ",\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"l2\":%u,\"r2\":%u,\"l2a\":%u,\"r2a\":%u",
++         s->b,s->a[0],s->a[1],s->a[2],s->a[3],s->a[4],s->a[5],s->a[6],s->a[7]);
+ }
+ /* The pending pad state, when the rate limit allows it now (called with state_lock held). */
+ static int take_pad(uint64_t now, PadState *out) {
+@@ -243,7 +250,12 @@ static int take_pad(uint64_t now, PadState *out) {
+ }
+ static int pad_differs(const PadState *a, const PadState *b) {
+     if (a->b!=b->b || a->a[4]!=b->a[4] || a->a[5]!=b->a[5]) return 1;
+-    for (int i=0;i<4;++i) { int d=(int)a->a[i]-(int)b->a[i]; if (d>=STICK_DEADBAND || d<=-STICK_DEADBAND) return 1; }
++    /* sticks and physical trigger travel: noise below the deadband is not a change */
++    for (int i=0;i<8;++i) {
++        if (i==4 || i==5) continue;
++        int d=(int)a->a[i]-(int)b->a[i];
++        if (d>=STICK_DEADBAND || d<=-STICK_DEADBAND) return 1;
++    }
+     return 0;
+ }
+ 
+@@ -319,12 +331,41 @@ static int open_socket(void) {
+     return 0;
+ }
+ 
++/* "l2,r2", each 1-254. */
++static int parse_thresholds(const char *text, int out[2]) {
++    for (int i=0;i<2;++i) {
++        if (*text<'0' || *text>'9') return -1;
++        int v=0, len=0;
++        while (*text>='0' && *text<='9') { v=v*10+(*text++-'0'); if (++len>3) return -1; }
++        if (v<1 || v>254) return -1;
++        out[i]=v;
++        if (!i) { if (*text!=',') return -1; ++text; }
++    }
++    return *text ? -1 : 0;
++}
++
+ void runtime_unds_start(uintptr_t image) {
+     const char *rumble=getenv("UNDS_RUMBLE");
+     if (rumble && !strcmp(rumble,"0")) {
+         atomic_store(&rumble_on,0);
+         puts("Runtime: UNDS: SDL rumble off (UNDS_RUMBLE=0); scePadSetVibration is still published");
+     }
++    const char *led=getenv("UNDS_LED");
++    if (led && !strcmp(led,"0")) {
++        atomic_store(&led_on,0);
++        puts("Runtime: UNDS: SDL light bar off (UNDS_LED=0); the light bar is still published");
++    }
++    const char *thresholds=getenv("UNDS_TRIGGER");
++    if (thresholds && *thresholds) {
++        int t[2];
++        if (parse_thresholds(thresholds,t))
++            printf("Runtime: UNDS: UNDS_TRIGGER=\"%s\" is not <l2>,<r2> (1-254 each); thresholds stay %d,%d\n",thresholds,
++                   atomic_load(&trigger_threshold[0]),atomic_load(&trigger_threshold[1]));
++        else {
++            atomic_store(&trigger_threshold[0],t[0]); atomic_store(&trigger_threshold[1],t[1]);
++            printf("Runtime: UNDS: trigger press thresholds L2>%d R2>%d of 255 (UNDS_TRIGGER)\n",t[0],t[1]);
++        }
++    }
+     const char *target=getenv("UNDS_EVENTS");
+     if (!target || !*target || atomic_load(&active)) return;
+     atomic_store(&configured,1);
+@@ -356,6 +397,10 @@ void runtime_unds_start(uintptr_t image) {
+ }
+ 
+ int runtime_unds_rumble_enabled(void) { return atomic_load_explicit(&rumble_on,memory_order_relaxed); }
++int runtime_unds_led_enabled(void) { return atomic_load_explicit(&led_on,memory_order_relaxed); }
++uint8_t runtime_unds_trigger_threshold(int right) {
++    return (uint8_t)atomic_load_explicit(&trigger_threshold[right ? 1 : 0],memory_order_relaxed);
++}
+ 
+ void runtime_unds_bye(const char *reason) {
+     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
+@@ -388,10 +433,11 @@ void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b) {
+     if (changed) emit("led",",\"r\":%u,\"g\":%u,\"b\":%u",r,g,b);
+ }
+ 
+-void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2) {
++void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2,
++                      uint8_t l2a, uint8_t r2a) {
+     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
+     const uint64_t now=now_us();
+-    const PadState state={buttons,{lx,ly,rx,ry,l2,r2}};
++    const PadState state={buttons,{lx,ly,rx,ry,l2,r2,l2a,r2a}};
+     PadState out; int send;
+     pthread_mutex_lock(&state_lock);
+     pad_now=state;
+diff --git a/src/runtime_unds.h b/src/runtime_unds.h
+index 68728e6..8c21b58 100644
+--- a/src/runtime_unds.h
++++ b/src/runtime_unds.h
+@@ -5,6 +5,11 @@
+  *
+  *   UNDS_EVENTS=127.0.0.1:47111   destination (numeric IPv4, "localhost", or a port alone)
+  *   UNDS_RUMBLE=0                 scePadSetVibration no longer drives SDL rumble (still published)
++ *   UNDS_LED=0                    the light bar no longer goes to SDL (still published): the
++ *                                 companion (DSX, later SDL in-process) owns the LED
++ *   UNDS_TRIGGER=<l2>,<r2>        trigger travel (1-254 of 255) above which L2 / R2 count as
++ *                                 pressed; default 30,30 (the port's built-in threshold)
++ * UNDS_RUMBLE, UNDS_LED and UNDS_TRIGGER work with or without UNDS_EVENTS.
+  *
+  * Protocol v1: every datagram is one JSON object with
+  *   "v":1  "seq":<uint32, per process>  "t":<CLOCK_MONOTONIC us>  "e":"<event>"  ...fields
+@@ -14,22 +19,29 @@
+ #include <stdint.h>
+ 
+ #define UNDS_PROTOCOL 1
+-#define UNDS_VERSION "0.2.0"
++#define UNDS_VERSION "0.3.0"
+ 
+-/* Reads UNDS_EVENTS / UNDS_RUMBLE; with UNDS_EVENTS, opens the socket, sends "hello" and starts
++/* Reads UNDS_EVENTS / UNDS_RUMBLE / UNDS_LED / UNDS_TRIGGER; with UNDS_EVENTS, opens the socket, sends "hello" and starts
+  * the 1 s heartbeat. `image` is the guest image base. Silent when neither variable is set. */
+ void runtime_unds_start(uintptr_t image);
+ /* 1 unless UNDS_RUMBLE=0. */
+ int runtime_unds_rumble_enabled(void);
++/* 1 unless UNDS_LED=0. */
++int runtime_unds_led_enabled(void);
++/* Press threshold of L2 (right=0) or R2 (right=1) on the 0-255 travel: 30, or UNDS_TRIGGER. */
++uint8_t runtime_unds_trigger_threshold(int right);
+ /* "bye" with a reason ("loadexec", "exit", "restart", "window", ...), at most once per process. */
+ void runtime_unds_bye(const char *reason);
+ /* scePadSetVibration: large and small motor, 0-255 (sent when they change, refreshed every 0.5 s). */
+ void runtime_unds_rumble(uint8_t large, uint8_t small);
+ /* Light bar colour (sent when it changes). */
+ void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b);
+-/* The pad state the game read (after injection/replay): sent when it changes, at most every 8 ms;
+- * a change held back by the limit is sent by a later read or by the heartbeat. */
+-void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2);
++/* The pad state the game read (after injection/replay), plus the physical L2/R2 travel (l2a,
++ * r2a: 0-255 before the press threshold; the game itself gets 0 or 255): sent when it changes,
++ * at most every 8 ms; a change held back by the limit is sent by a later read or by the
++ * heartbeat. */
++void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2,
++                      uint8_t l2a, uint8_t r2a);
+ /* An audio port was opened: resets that port's analysis and announces it. */
+ void runtime_unds_audio_open(int port, int type, int channels, int frames);
+ /* One output buffer of a port, after volume and channel mapping (SDL order for 8 channels:
+diff --git a/tests/test_unds.c b/tests/test_unds.c
+index c8d6ec6..fc404f5 100644
+--- a/tests/test_unds.c
++++ b/tests/test_unds.c
+@@ -1,5 +1,5 @@
+ /* UNDS event bus: endpoint parsing, change detection, pad rate limit, audio levels, protocol
+- * fields, seq continuity and "bye". Sends to a UDP socket of its own on 127.0.0.1.
++ * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER. Sends to a UDP socket of its own on 127.0.0.1.
+  * Linux:            cc -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
+  * MSYS2 CLANG64:    clang -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c src/compat_win.c -lws2_32 -lbcrypt -o out/unds-test.exe */
+ #include "../src/runtime_unds.c"
+@@ -73,6 +73,15 @@ static void test_parse(void) {
+     for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) assert(parse_endpoint(bad[i],&ip,&port));
+ }
+ 
++static void test_thresholds(void) {
++    int t[2]={0,0};
++    assert(!parse_thresholds("30,30",t) && t[0]==30 && t[1]==30);
++    assert(!parse_thresholds("1,254",t) && t[0]==1 && t[1]==254);
++    assert(!parse_thresholds("40,140",t) && t[0]==40 && t[1]==140);
++    const char *bad[]={"", "30", "30,", ",30", "0,30", "30,255", "30;30", "30,30,30", "a,30", "30, 30", "1000,30", "-1,30"};
++    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) assert(parse_thresholds(bad[i],t));
++}
++
+ static void test_audio(void) {
+     char e[512];
+     runtime_unds_audio_open(0,0,8,1024);
+@@ -111,12 +120,23 @@ static void test_audio(void) {
+ 
+ int main(void) {
+     test_parse();
++    test_thresholds();
+     set_env("BB_EXE","big2-ps4_Shipping.elf");
+-    /* No UNDS_EVENTS: nothing is active, every call returns at once. */
++    /* No UNDS_* variables: defaults, nothing is active, every call returns at once. */
+     runtime_unds_start(0x1234);
+-    assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled());
+-    runtime_unds_rumble(1,2); runtime_unds_pad(0,1,2,3,4,5,6); runtime_unds_bye("x");
++    assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled() && runtime_unds_led_enabled());
++    assert(runtime_unds_trigger_threshold(0)==30 && runtime_unds_trigger_threshold(1)==30);
++    runtime_unds_rumble(1,2); runtime_unds_pad(0,1,2,3,4,5,6,7,8); runtime_unds_bye("x");
+     assert(!atomic_load(&bye_done) && !atomic_load(&sent));
++    /* UNDS_LED and UNDS_TRIGGER work without UNDS_EVENTS; a malformed UNDS_TRIGGER changes nothing */
++    set_env("UNDS_TRIGGER","30,300");
++    runtime_unds_start(0x1234);
++    assert(runtime_unds_trigger_threshold(0)==30 && runtime_unds_trigger_threshold(1)==30 && !atomic_load(&active));
++    set_env("UNDS_LED","0");
++    set_env("UNDS_TRIGGER","40,140");
++    runtime_unds_start(0x1234);
++    assert(!runtime_unds_led_enabled() && runtime_unds_trigger_threshold(0)==40 && runtime_unds_trigger_threshold(1)==140);
++    assert(!atomic_load(&active) && !atomic_load(&sent));
+ 
+     char endpoint[64], e[512];
+     open_receiver(endpoint,sizeof(endpoint));
+@@ -126,7 +146,7 @@ int main(void) {
+     assert(atomic_load(&active) && !runtime_unds_rumble_enabled());
+     assert(receive(e,sizeof(e),500) && has(e,"\"e\":\"hello\"") && field(e,"seq")==0 && field(e,"boot")==1);
+     assert(has(e,"\"exe\":\"u2\"") && has(e,"\"bin\":\"big2-ps4_Shipping.elf\"") && has(e,"\"base\":\"0xb400000\""));
+-    assert(field(e,"rumble")==0 && field(e,"pid")>0);
++    assert(field(e,"rumble")==0 && field(e,"led")==0 && has(e,"\"trig\":\"40,140\"") && field(e,"pid")>0);
+     expect_seq=1;
+ 
+     /* rumble and LED: only changes */
+@@ -141,16 +161,18 @@ int main(void) {
+     no_event(30);
+ 
+     /* pad: first state, stick noise below the deadband, buttons through the limit, analog held */
+-    runtime_unds_pad(0,128,128,128,128,0,0);
+-    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"pad\"") && field(e,"lx")==128);
+-    runtime_unds_pad(0,129,127,128,128,0,0);
++    runtime_unds_pad(0,128,128,128,128,0,0,0,0);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"pad\"") && field(e,"lx")==128 && field(e,"r2a")==0);
++    runtime_unds_pad(0,129,127,128,128,0,0,1,1);             /* stick and trigger noise below the deadband */
+     no_event(30);
+-    runtime_unds_pad(0x200,128,128,128,128,0,255);           /* R2 pressed: sent at once */
+-    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255);
+-    runtime_unds_pad(0x200,128,128,128,128,0,200);           /* analog only, <8 ms later: held */
+-    runtime_unds_pad(0x200,128,128,128,128,0,180);
+-    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180); /* sent by the heartbeat */
+-    runtime_unds_pad(0,128,128,128,128,0,0);                 /* release: at once */
++    runtime_unds_pad(0,128,128,128,128,0,0,0,60);            /* R2 travel under the threshold: a change */
++    assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0 && field(e,"r2a")==60 && field(e,"l2a")==0);
++    runtime_unds_pad(0x200,128,128,128,128,0,255,0,150);     /* R2 pressed: sent at once */
++    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
++    runtime_unds_pad(0x200,128,128,128,128,0,200,0,150);     /* analog only, <8 ms later: held */
++    runtime_unds_pad(0x200,128,128,128,128,0,180,0,170);
++    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
++    runtime_unds_pad(0,128,128,128,128,0,0,0,0);             /* release: at once */
+     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
+ 
+     test_audio();
+-- 
+2.34.1
+

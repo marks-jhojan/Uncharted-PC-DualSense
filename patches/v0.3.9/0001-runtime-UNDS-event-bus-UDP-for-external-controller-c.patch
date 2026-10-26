@@ -1,0 +1,1003 @@
+From 6d0ce063a491ba3337ee6a1c0ade282501008581 Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 1/8] runtime: UNDS event bus (UDP) for external controller
+ companions
+
+With UNDS_EVENTS=host:port the runtime publishes, as one compact JSON
+datagram per event (protocol v1, integers only), what the game does with
+the controller and the audio, so an external program can drive DualSense
+adaptive triggers, haptics and the light bar:
+
+  hello   at start and every 1 s: executable (u1/u2/u3), image base, pid,
+          counters, open audio ports
+  bye     before LoadExec (_exit 101), guest exit, restart, window close
+  rumble  scePadSetVibration motors, on change (+0.5 s refresh)
+  led     light bar colour, on change
+  pad     the state the game read, on change (8 ms limit; buttons never
+          held back; stick deadband 2)
+  aopen   audio port opened
+  audio   per port, 512-frame windows (10.7 ms): RMS, peak and 150 Hz
+          low-passed RMS of the converted buffer; silence refreshed 1/s
+
+Sends are non-blocking (numeric IPv4 only, no DNS), made outside the pad
+lock; their duration is measured and reported. Without UNDS_EVENTS every
+hook is one relaxed atomic load and nothing is printed.
+
+UNDS_RUMBLE=0 stops scePadSetVibration from driving SDL rumble (the
+event is still published): SDL rumble and a companion's haptics share the
+DualSense actuators.
+
+tests/test_unds.c covers endpoint parsing, change detection, the pad rate
+limit, audio levels, seq continuity and bye (build.sh --test on Linux;
+ninja -C out/gpu unds-test on Windows).
+---
+ build.sh                         |   2 +
+ gpu/CMakeLists.txt               |   6 +
+ gpu/shim/bbgpu.cpp               |   3 +
+ src/probe.c                      |   3 +
+ src/runtime.c                    |   3 +
+ src/runtime_audio.c              |   4 +
+ src/runtime_pad.c                |  24 +-
+ src/runtime_services.c           |   2 +
+ src/runtime_unds.c               | 470 +++++++++++++++++++++++++++++++
+ src/runtime_unds.h               |  41 +++
+ tests/test_gpu_runtime_stubs.cpp |   1 +
+ tests/test_pad.c                 |   7 +
+ tests/test_unds.c                | 178 ++++++++++++
+ 13 files changed, 736 insertions(+), 8 deletions(-)
+ create mode 100644 src/runtime_unds.c
+ create mode 100644 src/runtime_unds.h
+ create mode 100644 tests/test_unds.c
+
+diff --git a/build.sh b/build.sh
+index 45e387e..0a56dad 100644
+--- a/build.sh
++++ b/build.sh
+@@ -109,4 +109,6 @@ if [[ ${1:-} == --test ]]; then
+     out/content-test
+     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_cpu_patch.c src/cpu_patch.c -lZydis -o out/cpu-patch-test
+     out/cpu-patch-test
++    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
++    out/unds-test
+ fi
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index a75a033..d5c6100 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -275,6 +275,12 @@ if (WIN32)
+     add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
+     target_compile_options(bb-play PRIVATE -municode)
+     target_link_options(bb-play PRIVATE -municode)
++    # UNDS event bus test (ninja -C out/gpu unds-test && out/gpu/unds-test.exe): no game, no GPU.
++    add_executable(unds-test EXCLUDE_FROM_ALL ../tests/test_unds.c ../src/compat_win.c)
++    set_target_properties(unds-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
++    target_compile_options(unds-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
++    target_include_directories(unds-test PRIVATE ../src)
++    target_link_libraries(unds-test PRIVATE ws2_32 bcrypt -pthread)
+ endif()
+ 
+ # Explicit test targets; neither launches the game nor needs a Vulkan device.
+diff --git a/gpu/shim/bbgpu.cpp b/gpu/shim/bbgpu.cpp
+index 91c755b..3b38290 100644
+--- a/gpu/shim/bbgpu.cpp
++++ b/gpu/shim/bbgpu.cpp
+@@ -49,6 +49,8 @@ uint64_t runtime_process_time_counter(void);
+ uint64_t runtime_tsc_frequency(void);
+ int32_t* runtime_errno(void);
+ void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
++// runtime_unds.c: "bye" for the UNDS event bus (nothing without UNDS_EVENTS)
++void runtime_unds_bye(const char* reason);
+ }
+ 
+ Frontend::WindowSDL* g_window = nullptr;
+@@ -248,6 +250,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
+             SDL_Delay(2);
+         }
+         std::printf("Window closed (close button, Alt+F4 or system quit request)\n");
++        runtime_unds_bye("window");
+         std::fflush(stdout);
+         Vulkan::FlushPipelineCacheForExit();
+         std::_Exit(0);
+diff --git a/src/probe.c b/src/probe.c
+index 1af8f06..76eb2a9 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -8,6 +8,7 @@
+ #include <time.h>
+ #include <cpuid.h>
+ #include "runtime.h"
++#include "runtime_unds.h"
+ #include "gpu/bbgpu.h"
+ #ifdef _WIN32
+ #include "red_zone.h"
+@@ -978,6 +979,7 @@ static void patch_job_sleep(uint64_t image_size) {
+  * applied at start). Descriptors are closed first so the old GPU device and its memory are
+  * released before the new process opens its own. */
+ void runtime_restart(void) {
++    runtime_unds_bye("restart");
+     fflush(NULL);
+ #ifdef _WIN32
+     /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
+@@ -1293,6 +1295,7 @@ int main(int argc, char **argv) {
+     if (!executable_entry) fail("entry is not executable");
+     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+     printf("Guest image at %p\n", (void *)image);
++    runtime_unds_start((uintptr_t)image); /* UNDS_EVENTS / UNDS_RUMBLE; silent without them */
+     if (native_libc) {
+         for (uint64_t m=0;m<module_count;++m) {
+             int init_executable=0;
+diff --git a/src/runtime.c b/src/runtime.c
+index d322dde..37578b7 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -1,6 +1,7 @@
+ /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
+ #define _CRT_RAND_S
+ #include "runtime.h"
++#include "runtime_unds.h"
+ #include "gpu/bbgpu.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -83,6 +84,7 @@ void runtime_report(void) {
+     runtime_savedata_report();
+     runtime_file_report();
+     runtime_fiber_report();
++    runtime_unds_report();
+     printf("Runtime: memory operations=%zu\n", (size_t)memory_calls);
+ }
+ static ABI void init_env(void) {
+@@ -176,6 +178,7 @@ static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
+ static ABI size_t guest_strlen(const char *text) { return strlen(text); }
+ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
+     printf("Runtime: guest requested exit(%d)\n", status);
++    runtime_unds_bye("exit");
+     runtime_finalize(NULL);
+     runtime_report();
+     exit(status);
+diff --git a/src/runtime_audio.c b/src/runtime_audio.c
+index 8fba18a..406bf10 100644
+--- a/src/runtime_audio.c
++++ b/src/runtime_audio.c
+@@ -8,6 +8,7 @@
+  * ports only follow the clock. */
+ #define _GNU_SOURCE
+ #include "runtime.h"
++#include "runtime_unds.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -152,6 +153,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
+         p->dump=fopen(path,"wb");
+     }
+     ++ports_opened;
++    runtime_unds_audio_open(id,type,p->channels,p->frames);
+     pthread_mutex_unlock(&table_lock);
+     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames%s)\n",id,type,p->channels,p->is_float ? "float" : "s16",length,
+            p->out_channels==2 && p->channels==8 ? ", folded to stereo" : p->out_channels==6 && p->channels==8 ? ", folded to 5.1" : "");
+@@ -194,6 +196,8 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
+             else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
+         }
+         if (p->dump) fwrite(converted,1,bytes,p->dump);
++        /* UNDS: levels of what is about to be queued (after volume, SDL channel order). */
++        runtime_unds_audio((int)(p-ports),p->type,converted,p->frames,p->channels,p->is_float);
+         /* Fewer speakers than the game's 7.1 mix: stereo gets FL/FR at full level and centre and
+            surrounds at -3 dB (LFE dropped); 5.1 keeps FL FR FC LFE and adds the back pair to the
+            sides at -3 dB. */
+diff --git a/src/runtime_pad.c b/src/runtime_pad.c
+index db898fa..f24b09d 100644
+--- a/src/runtime_pad.c
++++ b/src/runtime_pad.c
+@@ -17,6 +17,7 @@
+  * Options, Tab touchpad, arrow keys and the wheel the d-pad, IJKL the right stick. */
+ #define _GNU_SOURCE
+ #include "runtime.h"
++#include "runtime_unds.h"
+ #include "gpu/bbgpu.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -1114,6 +1115,8 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
+     pthread_mutex_lock(&lock);
+     sample(data); ++reads;
+     pthread_mutex_unlock(&lock);
++    /* UNDS: the state the game just read; published outside `lock` (data is the caller's buffer). */
++    runtime_unds_pad(data->buttons,data->left_x,data->left_y,data->right_x,data->right_y,data->l2,data->r2);
+     return 0;
+ }
+ /* Buffered read: the port samples once per call, so one entry is returned. */
+@@ -1139,15 +1142,19 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
+ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
+     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+     if (!param) return ERR_INVALID_ARG;
+-    pthread_mutex_lock(&lock);
+-    SDL_Gamepad *g=input.pad_vibration ? current_gamepad() : NULL;
+-    if (g) {
+-        const unsigned strength=(unsigned)input.pad_vibration_strength;
+-        const uint16_t low=(uint16_t)((param[0]*257u*strength+50u)/100u);
+-        const uint16_t high=(uint16_t)((param[1]*257u*strength+50u)/100u);
+-        SDL_RumbleGamepad(g,low,high,1000);
++    const uint8_t large=param[0], small=param[1];
++    if (runtime_unds_rumble_enabled()) {
++        pthread_mutex_lock(&lock);
++        SDL_Gamepad *g=input.pad_vibration ? current_gamepad() : NULL;
++        if (g) {
++            const unsigned strength=(unsigned)input.pad_vibration_strength;
++            const uint16_t low=(uint16_t)((large*257u*strength+50u)/100u);
++            const uint16_t high=(uint16_t)((small*257u*strength+50u)/100u);
++            SDL_RumbleGamepad(g,low,high,1000);
++        }
++        pthread_mutex_unlock(&lock);
+     }
+-    pthread_mutex_unlock(&lock);
++    runtime_unds_rumble(large,small); /* UNDS: the game's values, also with UNDS_RUMBLE=0 or vibration off */
+     return 0;
+ }
+ /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
+@@ -1156,6 +1163,7 @@ static void set_led(uint8_t r, uint8_t g, uint8_t b) {
+     SDL_Gamepad *pad=current_gamepad();
+     if (pad) SDL_SetGamepadLED(pad,r,g,b);
+     pthread_mutex_unlock(&lock);
++    runtime_unds_led(r,g,b);
+ }
+ static ABI int32_t pad_light_bar(int32_t handle, const uint8_t *rgb) {
+     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+diff --git a/src/runtime_services.c b/src/runtime_services.c
+index 1eba61c..fcf1efc 100644
+--- a/src/runtime_services.c
++++ b/src/runtime_services.c
+@@ -7,6 +7,7 @@
+ #define _GNU_SOURCE
+ #include <unistd.h>
+ #include "runtime.h"
++#include "runtime_unds.h"
+ #include "gpu/bbgpu.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -112,6 +113,7 @@ static ABI int32_t load_exec(const char *path, char *const *argv) {
+     fprintf(f,"%s\n",path);
+     for (int i=0;argv && argv[i] && i<32;++i) fprintf(f,"%s\n",argv[i]);
+     fclose(f);
++    runtime_unds_bye("loadexec");
+     fflush(NULL);
+     _exit(RUNTIME_LOADEXEC_EXIT);
+    __builtin_unreachable();
+diff --git a/src/runtime_unds.c b/src/runtime_unds.c
+new file mode 100644
+index 0000000..f84c222
+--- /dev/null
++++ b/src/runtime_unds.c
+@@ -0,0 +1,470 @@
++/* UNDS event bus (see runtime_unds.h): UDP datagrams with what the game does with the pad and
++ * the audio, for an external DualSense companion. Without UNDS_EVENTS every entry point returns
++ * after one relaxed atomic load and nothing is printed.
++ *
++ * Design:
++ * - One datagram per event, compact JSON, integers only (the guest may change the C locale; a
++ *   float printed as "0,5" would break the parser). ~60-150 bytes; one sendto (non-blocking
++ *   socket, numeric address: no DNS) of ~10-30 us on loopback, from the calling thread. A
++ *   sender thread would add a wakeup (and its latency) to every event for no gain at these
++ *   rates (~100-400 events/s). The time of every sendto is measured: the heartbeat reports the
++ *   longest, so a blocking send would show.
++ * - Change detection runs under a small lock of its own; the send happens after it is released.
++ *   The pad and audio hooks call in after (pad) or under (audio, per port: one writer) the
++ *   port's locks, never taking those locks here.
++ * - "seq" counts datagrams handed to sendto in this process: a gap at the receiver is a loss
++ *   (a datagram that sendto refused counts as a gap too). "t" is CLOCK_MONOTONIC in us.
++ * - Heartbeat thread (250 ms tick): "hello" every 1 s (a companion started late, or restarted,
++ *   picks up the emitter), rumble refresh every 0.5 s, pad changes held back by the rate limit,
++ *   error summary at most every 10 s.
++ *
++ * Events (fields after v, seq, t, e):
++ *   hello  boot(1 first, 0 heartbeat) exe(u1 u2 u3 or file) bin pid base("0x...") ver up(ms)
++ *          rumble(1 SDL rumble on) sent drop err smax(longest sendto since last hello, us)
++ *          vib(scePadSetVibration calls) ports("id:type:channels:frames,...")
++ *   bye    reason
++ *   rumble l s (0-255) re(1 refresh)
++ *   led    r g b re(1 refresh)
++ *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255)
++ *   aopen  p(port) ty(type) ch fr(frames per buffer)
++ *   audio  p ty f(first frame of the window, port timeline) n(frames) rms pk lf
++ *          levels x10000 of full scale over the window: rms of L/R (8 channels folded like the
++ *          stereo output: centre and surrounds at -3 dB, LFE dropped), peak |L|,|R|, and rms
++ *          of (L+R)/2 low-passed at 150 Hz (one pole). Digital silence (pk 0) is sent once and
++ *          then refreshed every 1 s instead of every window. */
++#define _GNU_SOURCE
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#endif
++#include "runtime.h"
++#include "runtime_unds.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <inttypes.h>
++#include <math.h>
++#include <pthread.h>
++#include <time.h>
++#ifndef _WIN32
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <errno.h>
++typedef int unds_socket_t;
++#define UNDS_INVALID_SOCKET (-1)
++#else
++typedef SOCKET unds_socket_t;
++#define UNDS_INVALID_SOCKET INVALID_SOCKET
++#endif
++
++#define UNDS_PORTS 25          /* runtime_audio.c PORTS */
++#define AUDIO_WINDOW 512       /* frames per audio event: 10.67 ms at 48 kHz */
++#define PAD_MIN_INTERVAL_US 8000
++#define STICK_DEADBAND 2
++#define HEARTBEAT_TICK_NS 250000000u
++#define SLOW_SEND_NS 1000000u
++
++static _Atomic int active;     /* sending */
++static _Atomic int configured; /* UNDS_EVENTS was set (the report prints) */
++static _Atomic int rumble_on=1;
++static _Atomic int bye_done;
++static unds_socket_t sock=UNDS_INVALID_SOCKET;
++static struct sockaddr_in destination;
++static _Atomic uint32_t seq;
++static _Atomic uint64_t sent, dropped, errors, slow_sends, vibration_calls;
++static _Atomic uint64_t send_max_ns, send_max_ns_total;
++static _Atomic int last_error, error_logged;
++static uintptr_t image_base;
++static uint64_t start_us;
++static unsigned long process_id;
++static char exe_id[16], exe_file[64];
++
++static pthread_mutex_t state_lock=PTHREAD_MUTEX_INITIALIZER;
++typedef struct { uint32_t b; uint8_t a[6]; } PadState; /* lx ly rx ry l2 r2 */
++static PadState pad_sent, pad_now;
++static int pad_valid, pad_pending;
++static uint64_t pad_sent_us;
++static int rumble_valid; static uint8_t rumble_l, rumble_s;
++static int led_valid; static uint8_t led_rgb[3];
++
++typedef struct {
++    int open, type, channels, frames, n, silent;
++    uint64_t frame, window_frame, silence_sent_us;
++    double sum2, sum_lf2;
++    float peak, lp;
++} AudioAcc;
++static AudioAcc audio_acc[UNDS_PORTS];
++
++static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
++static uint64_t now_us(void) { return now_ns()/1000u; }
++static void sleep_ns(uint64_t ns) {
++#ifdef _WIN32
++    compat_sleep_ns(ns);
++#else
++    struct timespec t={(time_t)(ns/1000000000u),(long)(ns%1000000000u)};
++    while (nanosleep(&t,&t)) {}
++#endif
++}
++static int socket_error(void) {
++#ifdef _WIN32
++    return WSAGetLastError();
++#else
++    return errno;
++#endif
++}
++static int would_block(int error) {
++#ifdef _WIN32
++    return error==WSAEWOULDBLOCK || error==WSAENOBUFS;
++#else
++    return error==EAGAIN || error==EWOULDBLOCK || error==ENOBUFS;
++#endif
++}
++
++/* "a.b.c.d:port", "localhost:port" or "port" (127.0.0.1). Numeric only: a name lookup could block. */
++static int parse_endpoint(const char *text, uint32_t *ip, uint16_t *port) {
++    if (!text || !*text) return -1;
++    const char *colon=strrchr(text,':'), *digits=colon ? colon+1 : text;
++    uint32_t address=0x7f000001u;
++    if (colon) {
++        size_t host=(size_t)(colon-text);
++        if (host==9 && !strncmp(text,"localhost",9)) address=0x7f000001u;
++        else {
++            unsigned part[4]; int count=0; const char *s=text;
++            while (count<4) {
++                if (s>=colon || *s<'0' || *s>'9') return -1;
++                unsigned v=0; int len=0;
++                while (s<colon && *s>='0' && *s<='9') { v=v*10u+(unsigned)(*s-'0'); ++s; if (++len>3) return -1; }
++                if (v>255) return -1;
++                part[count++]=v;
++                if (count<4) { if (s>=colon || *s!='.') return -1; ++s; }
++            }
++            if (s!=colon) return -1;
++            address=part[0]<<24 | part[1]<<16 | part[2]<<8 | part[3];
++        }
++    }
++    if (!*digits) return -1;
++    unsigned long value=0;
++    for (const char *s=digits;*s;++s) {
++        if (*s<'0' || *s>'9') return -1;
++        value=value*10u+(unsigned long)(*s-'0');
++        if (value>65535u) return -1;
++    }
++    if (!value) return -1;
++    *ip=address; *port=(uint16_t)value;
++    return 0;
++}
++
++static void note_send_time(uint64_t ns) {
++    uint64_t seen=atomic_load_explicit(&send_max_ns,memory_order_relaxed);
++    while (ns>seen && !atomic_compare_exchange_weak_explicit(&send_max_ns,&seen,ns,memory_order_relaxed,memory_order_relaxed)) {}
++    seen=atomic_load_explicit(&send_max_ns_total,memory_order_relaxed);
++    while (ns>seen && !atomic_compare_exchange_weak_explicit(&send_max_ns_total,&seen,ns,memory_order_relaxed,memory_order_relaxed)) {}
++    if (ns>SLOW_SEND_NS) atomic_fetch_add_explicit(&slow_sends,1,memory_order_relaxed);
++}
++static void send_datagram(const char *data, size_t size) {
++    const uint64_t begin=now_ns();
++#ifdef _WIN32
++    const int result=sendto(sock,data,(int)size,0,(const struct sockaddr *)&destination,(int)sizeof(destination));
++    const int failed=result==SOCKET_ERROR;
++#else
++    const ssize_t result=sendto(sock,data,size,MSG_DONTWAIT,(const struct sockaddr *)&destination,sizeof(destination));
++    const int failed=result<0;
++#endif
++    const int error=failed ? socket_error() : 0;
++    note_send_time(now_ns()-begin);
++    if (!failed) { atomic_fetch_add_explicit(&sent,1,memory_order_relaxed); return; }
++    atomic_store_explicit(&last_error,error,memory_order_relaxed);
++    if (would_block(error)) atomic_fetch_add_explicit(&dropped,1,memory_order_relaxed);
++    else atomic_fetch_add_explicit(&errors,1,memory_order_relaxed);
++    if (!atomic_exchange_explicit(&error_logged,1,memory_order_relaxed))
++        printf("Runtime: UNDS: sendto failed (error %d); further failures are only counted\n",error);
++}
++/* One event: the common header, then `fields` (",\"k\":v..." or empty). */
++__attribute__((format(printf,2,3)))
++static void emit(const char *event, const char *fields, ...) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
++    if (atomic_load_explicit(&bye_done,memory_order_relaxed) && strcmp(event,"bye")) return;
++    char text[512];
++    const uint32_t n=atomic_fetch_add_explicit(&seq,1,memory_order_relaxed);
++    int head=snprintf(text,sizeof(text),"{\"v\":%d,\"seq\":%" PRIu32 ",\"t\":%" PRIu64 ",\"e\":\"%s\"",
++                      UNDS_PROTOCOL,n,now_us(),event);
++    if (head<0 || (size_t)head>=sizeof(text)) { atomic_fetch_add_explicit(&errors,1,memory_order_relaxed); return; }
++    va_list args;
++    va_start(args,fields);
++    int body=vsnprintf(text+head,sizeof(text)-(size_t)head,fields,args);
++    va_end(args);
++    if (body<0 || (size_t)(head+body)+2>sizeof(text)) { atomic_fetch_add_explicit(&errors,1,memory_order_relaxed); return; }
++    size_t size=(size_t)(head+body);
++    text[size++]='}'; text[size]=0;
++    send_datagram(text,size);
++}
++
++static void ports_text(char *out, size_t size) {
++    size_t used=0; out[0]=0;
++    for (int i=0;i<UNDS_PORTS;++i) {
++        const AudioAcc *a=&audio_acc[i];
++        if (!a->open) continue;
++        int w=snprintf(out+used,size-used,"%s%d:%d:%d:%d",used ? "," : "",i,a->type,a->channels,a->frames);
++        if (w<0 || (size_t)w>=size-used) break;
++        used+=(size_t)w;
++    }
++}
++static void send_hello(int boot) {
++    char ports[256];
++    pthread_mutex_lock(&state_lock);
++    ports_text(ports,sizeof(ports));
++    pthread_mutex_unlock(&state_lock);
++    const uint64_t smax=atomic_exchange_explicit(&send_max_ns,0,memory_order_relaxed);
++    emit("hello",",\"boot\":%d,\"exe\":\"%s\",\"bin\":\"%s\",\"pid\":%lu,\"base\":\"0x%" PRIxPTR "\",\"ver\":\"%s\","
++         "\"up\":%" PRIu64 ",\"rumble\":%d,\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
++         "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"",
++         boot,exe_id,exe_file,process_id,image_base,UNDS_VERSION,(now_us()-start_us)/1000u,
++         atomic_load_explicit(&rumble_on,memory_order_relaxed),
++         atomic_load_explicit(&sent,memory_order_relaxed),atomic_load_explicit(&dropped,memory_order_relaxed),
++         atomic_load_explicit(&errors,memory_order_relaxed),smax/1000u,
++         atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports);
++}
++
++static void send_pad(const PadState *s) {
++    emit("pad",",\"b\":%" PRIu32 ",\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,\"l2\":%u,\"r2\":%u",
++         s->b,s->a[0],s->a[1],s->a[2],s->a[3],s->a[4],s->a[5]);
++}
++/* The pending pad state, when the rate limit allows it now (called with state_lock held). */
++static int take_pad(uint64_t now, PadState *out) {
++    if (!pad_pending || now-pad_sent_us<PAD_MIN_INTERVAL_US) return 0;
++    *out=pad_now; pad_sent=pad_now; pad_pending=0; pad_sent_us=now;
++    return 1;
++}
++static int pad_differs(const PadState *a, const PadState *b) {
++    if (a->b!=b->b || a->a[4]!=b->a[4] || a->a[5]!=b->a[5]) return 1;
++    for (int i=0;i<4;++i) { int d=(int)a->a[i]-(int)b->a[i]; if (d>=STICK_DEADBAND || d<=-STICK_DEADBAND) return 1; }
++    return 0;
++}
++
++static void *heartbeat(void *argument) {
++    (void)argument;
++    uint64_t errors_logged_count=0, errors_logged_us=0;
++    for (unsigned tick=1;;++tick) {
++        sleep_ns(HEARTBEAT_TICK_NS);
++        if (atomic_load_explicit(&bye_done,memory_order_relaxed)) return NULL;
++        const uint64_t now=now_us();
++        PadState pad; int have_pad;
++        int refresh_rumble=0, refresh_led=0; uint8_t l=0, s=0, rgb[3]={0,0,0};
++        pthread_mutex_lock(&state_lock);
++        have_pad=take_pad(now,&pad);
++        if (!(tick%2) && rumble_valid) { refresh_rumble=1; l=rumble_l; s=rumble_s; }
++        if (!(tick%4) && led_valid) { refresh_led=1; memcpy(rgb,led_rgb,3); }
++        pthread_mutex_unlock(&state_lock);
++        if (have_pad) send_pad(&pad);
++        if (!(tick%4)) send_hello(0);
++        if (refresh_rumble) emit("rumble",",\"l\":%u,\"s\":%u,\"re\":1",l,s);
++        if (refresh_led) emit("led",",\"r\":%u,\"g\":%u,\"b\":%u,\"re\":1",rgb[0],rgb[1],rgb[2]);
++        const uint64_t failures=atomic_load_explicit(&errors,memory_order_relaxed)+atomic_load_explicit(&dropped,memory_order_relaxed);
++        if (failures!=errors_logged_count && now-errors_logged_us>=10000000u) {
++            printf("Runtime: UNDS: %" PRIu64 " failed sends so far (last error %d)\n",failures,
++                   atomic_load_explicit(&last_error,memory_order_relaxed));
++            errors_logged_count=failures; errors_logged_us=now;
++        }
++    }
++}
++
++static void exe_names(void) {
++    const char *value=getenv("BB_EXE");
++    const char *name=value && *value ? value : "eboot.bin";
++    const char *slash=strrchr(name,'/'), *back=strrchr(name,'\\');
++    if (back && (!slash || back>slash)) slash=back;
++    if (slash) name=slash+1;
++    size_t i=0;
++    for (;name[i] && i+1<sizeof(exe_file);++i) {
++        char c=name[i];
++        exe_file[i]=(c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='.' || c=='-' || c=='_' ? c : '_';
++    }
++    exe_file[i]=0;
++    const char *id=!strcmp(exe_file,"eboot.bin") || !strcmp(exe_file,"u1") ? "u1" :
++                   !strncmp(exe_file,"big2",4) || !strcmp(exe_file,"u2") ? "u2" :
++                   !strncmp(exe_file,"big3",4) || !strcmp(exe_file,"u3") ? "u3" : "other";
++    snprintf(exe_id,sizeof(exe_id),"%s",id);
++}
++
++static int open_socket(void) {
++#ifdef _WIN32
++    WSADATA data;
++    int error=WSAStartup(MAKEWORD(2,2),&data);
++    if (error) { printf("Runtime: UNDS: WSAStartup failed (%d); events off\n",error); return -1; }
++#ifdef WSA_FLAG_NO_HANDLE_INHERIT
++    sock=WSASocketW(AF_INET,SOCK_DGRAM,IPPROTO_UDP,NULL,0,WSA_FLAG_NO_HANDLE_INHERIT);
++#else
++    sock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
++#endif
++    if (sock==INVALID_SOCKET) { printf("Runtime: UNDS: socket failed (%d); events off\n",WSAGetLastError()); return -1; }
++    u_long nonblocking=1;
++    if (ioctlsocket(sock,FIONBIO,&nonblocking)) {
++        printf("Runtime: UNDS: non-blocking mode failed (%d); events off\n",WSAGetLastError());
++        closesocket(sock); sock=INVALID_SOCKET; return -1;
++    }
++    int buffer=1<<18;
++    setsockopt(sock,SOL_SOCKET,SO_SNDBUF,(const char *)&buffer,sizeof(buffer));
++#else
++    sock=socket(AF_INET,SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK,IPPROTO_UDP);
++    if (sock<0) { printf("Runtime: UNDS: socket failed (%d); events off\n",errno); return -1; }
++    int buffer=1<<18;
++    setsockopt(sock,SOL_SOCKET,SO_SNDBUF,&buffer,sizeof(buffer));
++#endif
++    return 0;
++}
++
++void runtime_unds_start(uintptr_t image) {
++    const char *rumble=getenv("UNDS_RUMBLE");
++    if (rumble && !strcmp(rumble,"0")) {
++        atomic_store(&rumble_on,0);
++        puts("Runtime: UNDS: SDL rumble off (UNDS_RUMBLE=0); scePadSetVibration is still published");
++    }
++    const char *target=getenv("UNDS_EVENTS");
++    if (!target || !*target || atomic_load(&active)) return;
++    atomic_store(&configured,1);
++    uint32_t ip; uint16_t port;
++    if (parse_endpoint(target,&ip,&port)) {
++        printf("Runtime: UNDS: UNDS_EVENTS=\"%s\" is not IPv4:port, localhost:port or a port; events off\n",target);
++        return;
++    }
++    if (open_socket()) return;
++    memset(&destination,0,sizeof(destination));
++    destination.sin_family=AF_INET;
++    destination.sin_port=htons(port);
++    destination.sin_addr.s_addr=htonl(ip);
++    image_base=image;
++    start_us=now_us();
++#ifdef _WIN32
++    process_id=(unsigned long)GetCurrentProcessId();
++#else
++    process_id=(unsigned long)getpid();
++#endif
++    exe_names();
++    atomic_store(&active,1);
++    printf("Runtime: UNDS: events to %u.%u.%u.%u:%u (protocol %d, %s, %s)\n",ip>>24,(ip>>16)&255u,(ip>>8)&255u,ip&255u,
++           port,UNDS_PROTOCOL,UNDS_VERSION,exe_id);
++    send_hello(1);
++    pthread_t thread;
++    if (pthread_create(&thread,NULL,heartbeat,NULL)) puts("Runtime: UNDS: no heartbeat thread (pthread_create failed)");
++    else pthread_detach(thread);
++}
++
++int runtime_unds_rumble_enabled(void) { return atomic_load_explicit(&rumble_on,memory_order_relaxed); }
++
++void runtime_unds_bye(const char *reason) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
++    if (atomic_exchange(&bye_done,1)) return;
++    char clean[32]; size_t i=0;
++    for (;reason && reason[i] && i+1<sizeof(clean);++i)
++        clean[i]=(reason[i]>='a' && reason[i]<='z') || (reason[i]>='0' && reason[i]<='9') || reason[i]=='_' ? reason[i] : '_';
++    clean[i]=0;
++    /* "sent" counts this datagram too: the receiver compares it with what it got. */
++    emit("bye",",\"reason\":\"%s\",\"up\":%" PRIu64 ",\"sent\":%" PRIu64,clean,(now_us()-start_us)/1000u,
++         atomic_load_explicit(&sent,memory_order_relaxed)+1u);
++}
++
++void runtime_unds_rumble(uint8_t large, uint8_t small) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
++    atomic_fetch_add_explicit(&vibration_calls,1,memory_order_relaxed);
++    pthread_mutex_lock(&state_lock);
++    const int changed=!rumble_valid || rumble_l!=large || rumble_s!=small;
++    rumble_valid=1; rumble_l=large; rumble_s=small;
++    pthread_mutex_unlock(&state_lock);
++    if (changed) emit("rumble",",\"l\":%u,\"s\":%u",large,small);
++}
++
++void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
++    pthread_mutex_lock(&state_lock);
++    const int changed=!led_valid || led_rgb[0]!=r || led_rgb[1]!=g || led_rgb[2]!=b;
++    led_valid=1; led_rgb[0]=r; led_rgb[1]=g; led_rgb[2]=b;
++    pthread_mutex_unlock(&state_lock);
++    if (changed) emit("led",",\"r\":%u,\"g\":%u,\"b\":%u",r,g,b);
++}
++
++void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
++    const uint64_t now=now_us();
++    const PadState state={buttons,{lx,ly,rx,ry,l2,r2}};
++    PadState out; int send;
++    pthread_mutex_lock(&state_lock);
++    pad_now=state;
++    pad_pending=!pad_valid || pad_differs(&pad_now,&pad_sent);
++    /* Buttons are never held back: a press and its release must both reach the companion. */
++    if (pad_pending && (!pad_valid || pad_now.b!=pad_sent.b)) pad_sent_us=0;
++    pad_valid=1;
++    send=take_pad(now,&out);
++    pthread_mutex_unlock(&state_lock);
++    if (send) send_pad(&out);
++}
++
++void runtime_unds_audio_open(int port, int type, int channels, int frames) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed) || port<0 || port>=UNDS_PORTS) return;
++    pthread_mutex_lock(&state_lock);
++    memset(&audio_acc[port],0,sizeof(audio_acc[port]));
++    audio_acc[port].open=1; audio_acc[port].type=type; audio_acc[port].channels=channels; audio_acc[port].frames=frames;
++    pthread_mutex_unlock(&state_lock);
++    emit("aopen",",\"p\":%d,\"ty\":%d,\"ch\":%d,\"fr\":%d",port,type,channels,frames);
++}
++
++static unsigned level(double value) {
++    const double scaled=value*10000.0+0.5;
++    return scaled>=4.0e9 ? 4000000000u : (unsigned)scaled;
++}
++static void audio_window(int port, int type, AudioAcc *a) {
++    const unsigned rms=level(sqrt(a->sum2/(double)a->n)), peak=level(a->peak), low=level(sqrt(a->sum_lf2/(double)a->n));
++    const uint64_t first=a->window_frame;
++    const int frames=a->n;
++    a->window_frame=a->frame; a->n=0; a->sum2=a->sum_lf2=0.0; a->peak=0.0f;
++    if (!peak) {
++        const uint64_t now=now_us();
++        if (a->silent && now-a->silence_sent_us<1000000u) return;
++        a->silent=1; a->silence_sent_us=now;
++    } else a->silent=0;
++    emit("audio",",\"p\":%d,\"ty\":%d,\"f\":%" PRIu64 ",\"n\":%d,\"rms\":%u,\"pk\":%u,\"lf\":%u",
++         port,type,first,frames,rms,peak,low);
++}
++void runtime_unds_audio(int port, int type, const void *pcm, int frames, int channels, int is_float) {
++    if (!atomic_load_explicit(&active,memory_order_relaxed) || port<0 || port>=UNDS_PORTS || !pcm ||
++        frames<=0 || channels<=0 || channels>8) return;
++    AudioAcc *a=&audio_acc[port];
++    /* One-pole low-pass at 150 Hz: 1 - exp(-2*pi*150/48000). */
++    const float coefficient=0.019443f;
++    for (int f=0;f<frames;++f) {
++        float s[8]={0,0,0,0,0,0,0,0};
++        for (int c=0;c<channels;++c) {
++            const size_t index=(size_t)f*(size_t)channels+(size_t)c;
++            if (is_float) memcpy(&s[c],(const char *)pcm+index*4,4);
++            else { int16_t v; memcpy(&v,(const char *)pcm+index*2,2); s[c]=(float)v/32768.0f; }
++        }
++        float l, r;
++        if (channels==8) { l=s[0]+0.7071f*(s[2]+s[4]+s[6]); r=s[1]+0.7071f*(s[2]+s[5]+s[7]); }
++        else if (channels==1) l=r=s[0];
++        else { l=s[0]; r=s[1]; }
++        if (!(l==l)) l=0.0f; /* NaN */
++        if (!(r==r)) r=0.0f;
++        const float al=fabsf(l), ar=fabsf(r);
++        if (al>a->peak) a->peak=al;
++        if (ar>a->peak) a->peak=ar;
++        a->sum2+=0.5*((double)l*l+(double)r*r);
++        a->lp+=coefficient*(0.5f*(l+r)-a->lp);
++        if (fabsf(a->lp)<1e-12f) a->lp=0.0f; /* no denormals */
++        a->sum_lf2+=(double)a->lp*a->lp;
++        ++a->frame;
++        if (++a->n==AUDIO_WINDOW) audio_window(port,type,a);
++    }
++}
++
++void runtime_unds_report(void) {
++    if (!atomic_load(&configured)) return;
++    printf("Runtime: UNDS events sent=%" PRIu64 ", dropped=%" PRIu64 ", errors=%" PRIu64 " (last %d), "
++           "longest sendto %" PRIu64 " us, sends over 1 ms=%" PRIu64 ", scePadSetVibration calls=%" PRIu64 "\n",
++           atomic_load(&sent),atomic_load(&dropped),atomic_load(&errors),atomic_load(&last_error),
++           atomic_load(&send_max_ns_total)/1000u,atomic_load(&slow_sends),atomic_load(&vibration_calls));
++}
+diff --git a/src/runtime_unds.h b/src/runtime_unds.h
+new file mode 100644
+index 0000000..68728e6
+--- /dev/null
++++ b/src/runtime_unds.h
+@@ -0,0 +1,41 @@
++/* UNDS event bus: the runtime publishes what the game does with the controller and the audio
++ * (rumble, light bar, pad state, audio levels) as UDP datagrams for an external companion
++ * (DualSense adaptive triggers and haptics). Off unless UNDS_EVENTS=host:port is set; then each
++ * event is one non-blocking sendto of a compact JSON object. Nothing here waits on the network.
++ *
++ *   UNDS_EVENTS=127.0.0.1:47111   destination (numeric IPv4, "localhost", or a port alone)
++ *   UNDS_RUMBLE=0                 scePadSetVibration no longer drives SDL rumble (still published)
++ *
++ * Protocol v1: every datagram is one JSON object with
++ *   "v":1  "seq":<uint32, per process>  "t":<CLOCK_MONOTONIC us>  "e":"<event>"  ...fields
++ * Only integers are sent (no locale-dependent float formatting). See runtime_unds.c. */
++#ifndef BB_RUNTIME_UNDS_H
++#define BB_RUNTIME_UNDS_H
++#include <stdint.h>
++
++#define UNDS_PROTOCOL 1
++#define UNDS_VERSION "0.2.0"
++
++/* Reads UNDS_EVENTS / UNDS_RUMBLE; with UNDS_EVENTS, opens the socket, sends "hello" and starts
++ * the 1 s heartbeat. `image` is the guest image base. Silent when neither variable is set. */
++void runtime_unds_start(uintptr_t image);
++/* 1 unless UNDS_RUMBLE=0. */
++int runtime_unds_rumble_enabled(void);
++/* "bye" with a reason ("loadexec", "exit", "restart", "window", ...), at most once per process. */
++void runtime_unds_bye(const char *reason);
++/* scePadSetVibration: large and small motor, 0-255 (sent when they change, refreshed every 0.5 s). */
++void runtime_unds_rumble(uint8_t large, uint8_t small);
++/* Light bar colour (sent when it changes). */
++void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b);
++/* The pad state the game read (after injection/replay): sent when it changes, at most every 8 ms;
++ * a change held back by the limit is sent by a later read or by the heartbeat. */
++void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2);
++/* An audio port was opened: resets that port's analysis and announces it. */
++void runtime_unds_audio_open(int port, int type, int channels, int frames);
++/* One output buffer of a port, after volume and channel mapping (SDL order for 8 channels:
++ * FL FR FC LFE BL BR SL SR). Levels are analysed in 512-frame windows (10.7 ms at 48 kHz). Call
++ * with the port's lock held (one writer per port). */
++void runtime_unds_audio(int port, int type, const void *pcm, int frames, int channels, int is_float);
++/* Counters for runtime_report (prints nothing when the bus is off). */
++void runtime_unds_report(void);
++#endif
+diff --git a/tests/test_gpu_runtime_stubs.cpp b/tests/test_gpu_runtime_stubs.cpp
+index 5d8464a..e4ffdfa 100644
+--- a/tests/test_gpu_runtime_stubs.cpp
++++ b/tests/test_gpu_runtime_stubs.cpp
+@@ -18,6 +18,7 @@ void runtime_memory_set_gpu_hooks(void (*)(uintptr_t, uint64_t),
+ void runtime_thread_attach_host(const char*) {}
+ void runtime_memory_gpu_protect(uintptr_t, uint64_t, int, int) { std::abort(); }
+ void runtime_restart() { std::abort(); }
++void runtime_unds_bye(const char*) {}
+ uint64_t runtime_process_time_counter() { return runtime_process_time_us() * 1000; }
+ int32_t* runtime_errno() { std::abort(); }
+ int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(); }
+diff --git a/tests/test_pad.c b/tests/test_pad.c
+index d65a97e..98ac7d9 100644
+--- a/tests/test_pad.c
++++ b/tests/test_pad.c
+@@ -14,6 +14,13 @@ int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel) {
+ }
+ int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds) { (void)yaw_degrees; (void)age_seconds; return 0; }
+ void bbgpu_prompts_controller(int device) { (void)device; }
++/* UNDS event bus (runtime_unds.c): off in this test. */
++int runtime_unds_rumble_enabled(void) { return 1; }
++void runtime_unds_rumble(uint8_t large, uint8_t small) { (void)large; (void)small; }
++void runtime_unds_led(uint8_t r, uint8_t g, uint8_t b) { (void)r; (void)g; (void)b; }
++void runtime_unds_pad(uint32_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint8_t l2, uint8_t r2) {
++    (void)buttons; (void)lx; (void)ly; (void)rx; (void)ry; (void)l2; (void)r2;
++}
+ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
+     (void)table; (void)count; (void)name;
+     return 0;
+diff --git a/tests/test_unds.c b/tests/test_unds.c
+new file mode 100644
+index 0000000..c8d6ec6
+--- /dev/null
++++ b/tests/test_unds.c
+@@ -0,0 +1,178 @@
++/* UNDS event bus: endpoint parsing, change detection, pad rate limit, audio levels, protocol
++ * fields, seq continuity and "bye". Sends to a UDP socket of its own on 127.0.0.1.
++ * Linux:            cc -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
++ * MSYS2 CLANG64:    clang -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c src/compat_win.c -lws2_32 -lbcrypt -o out/unds-test.exe */
++#include "../src/runtime_unds.c"
++#undef NDEBUG /* the checks below have side effects */
++#include <assert.h>
++
++static unds_socket_t rx=UNDS_INVALID_SOCKET;
++static uint32_t expect_seq;
++
++static void open_receiver(char *endpoint, size_t size) {
++#ifdef _WIN32
++    WSADATA data; assert(!WSAStartup(MAKEWORD(2,2),&data));
++#endif
++    rx=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
++    assert(rx!=UNDS_INVALID_SOCKET);
++    struct sockaddr_in a; memset(&a,0,sizeof(a));
++    a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(0x7f000001u); a.sin_port=0;
++    assert(!bind(rx,(struct sockaddr *)&a,sizeof(a)));
++    socklen_t len=sizeof(a);
++    assert(!getsockname(rx,(struct sockaddr *)&a,&len));
++    snprintf(endpoint,size,"127.0.0.1:%u",(unsigned)ntohs(a.sin_port));
++}
++/* Next datagram within `ms`, or 0. */
++static int receive(char *out, size_t size, int ms) {
++    fd_set set; FD_ZERO(&set); FD_SET(rx,&set);
++    struct timeval timeout={ms/1000,(ms%1000)*1000};
++    if (select((int)rx+1,&set,NULL,NULL,&timeout)<=0) return 0;
++    int n=(int)recv(rx,out,(int)size-1,0);
++    assert(n>0);
++    out[n]=0;
++    return 1;
++}
++static long long field(const char *json, const char *key) {
++    char pattern[64]; snprintf(pattern,sizeof(pattern),"\"%s\":",key);
++    const char *at=strstr(json,pattern);
++    assert(at && "missing field");
++    return strtoll(at+strlen(pattern),NULL,10);
++}
++static int has(const char *json, const char *text) { return strstr(json,text)!=NULL; }
++/* Next datagram that is not a heartbeat (hello, refreshes); checks v and seq continuity. */
++static int next_event(char *out, size_t size, int ms) {
++    for (;;) {
++        if (!receive(out,size,ms)) return 0;
++        assert(field(out,"v")==1);
++        assert((uint32_t)field(out,"seq")==expect_seq);
++        ++expect_seq;
++        if (has(out,"\"e\":\"hello\"") || has(out,"\"re\":1")) continue;
++        return 1;
++    }
++}
++static void no_event(int ms) {
++    char text[512];
++    assert(!next_event(text,sizeof(text),ms));
++}
++static void set_env(const char *name, const char *value) {
++#ifdef _WIN32
++    _putenv_s(name,value);
++#else
++    setenv(name,value,1);
++#endif
++}
++
++static void test_parse(void) {
++    uint32_t ip; uint16_t port;
++    assert(!parse_endpoint("127.0.0.1:47111",&ip,&port) && ip==0x7f000001u && port==47111);
++    assert(!parse_endpoint("localhost:9",&ip,&port) && ip==0x7f000001u && port==9);
++    assert(!parse_endpoint("47111",&ip,&port) && ip==0x7f000001u && port==47111);
++    assert(!parse_endpoint("192.168.1.20:65535",&ip,&port) && ip==0xc0a80114u && port==65535);
++    const char *bad[]={"", ":1", "127.0.0.1:", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0:1", "127.0.0.1.5:1",
++                       "256.0.0.1:1", "host.lan:1", "127.0.0.1:12a", "1270.0.0.1:1", "::1:5", "127.0.0.1 :1"};
++    for (size_t i=0;i<sizeof(bad)/sizeof(*bad);++i) assert(parse_endpoint(bad[i],&ip,&port));
++}
++
++static void test_audio(void) {
++    char e[512];
++    runtime_unds_audio_open(0,0,8,1024);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"aopen\"") && field(e,"p")==0 && field(e,"ch")==8 && field(e,"fr")==1024);
++    /* 1.5 kHz (16 whole periods per window), 0.5 peak on FL only (8 ch float): rms over L/R 0.25, peak 0.5 */
++    static float pcm[1024*8];
++    for (int f=0;f<1024;++f) pcm[f*8]=0.5f*sinf(2.0f*3.14159265f*1500.0f*(float)f/48000.0f);
++    runtime_unds_audio(0,0,pcm,1024,8,1);
++    for (int w=0;w<2;++w) {
++        assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"audio\""));
++        assert(field(e,"p")==0 && field(e,"ty")==0 && field(e,"n")==512 && field(e,"f")==w*512);
++        assert(llabs(field(e,"rms")-2500)<=2 && llabs(field(e,"pk")-5000)<=2);
++        assert(field(e,"lf")<300); /* 1.5 kHz is well above the 150 Hz low-pass */
++    }
++    /* 93.75 Hz (one period per window) on FL and FR: rms 0.3536, mostly passes the low-pass (|H| 0.85) */
++    for (int f=0;f<1024;++f) pcm[f*8]=pcm[f*8+1]=0.5f*sinf(2.0f*3.14159265f*93.75f*(float)f/48000.0f);
++    runtime_unds_audio(0,0,pcm,1024,8,1);
++    assert(next_event(e,sizeof(e),500));
++    assert(next_event(e,sizeof(e),500) && field(e,"f")==1536 && llabs(field(e,"rms")-3536)<=2 && field(e,"lf")>2800 && field(e,"lf")<3100);
++    /* Silence: one window is sent, the following ones are held back for 1 s */
++    memset(pcm,0,sizeof(pcm));
++    runtime_unds_audio(0,0,pcm,1024,8,1);
++    runtime_unds_audio(0,0,pcm,1024,8,1);
++    assert(next_event(e,sizeof(e),500) && field(e,"pk")==0 && field(e,"rms")==0 && field(e,"f")==2048);
++    no_event(100);
++    /* s16 mono (pad speaker port): full-scale square of +-16384 -> rms 0.5, peak 0.5 */
++    runtime_unds_audio_open(17,4,1,256);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"aopen\""));
++    static int16_t mono[256];
++    for (int f=0;f<256;++f) mono[f]=(int16_t)(f&1 ? 16384 : -16384);
++    runtime_unds_audio(17,4,mono,256,1,0);
++    no_event(50); /* half a window */
++    runtime_unds_audio(17,4,mono,256,1,0);
++    assert(next_event(e,sizeof(e),500) && field(e,"p")==17 && field(e,"ty")==4 && field(e,"rms")==5000 && field(e,"pk")==5000);
++}
++
++int main(void) {
++    test_parse();
++    set_env("BB_EXE","big2-ps4_Shipping.elf");
++    /* No UNDS_EVENTS: nothing is active, every call returns at once. */
++    runtime_unds_start(0x1234);
++    assert(!atomic_load(&active) && !atomic_load(&configured) && runtime_unds_rumble_enabled());
++    runtime_unds_rumble(1,2); runtime_unds_pad(0,1,2,3,4,5,6); runtime_unds_bye("x");
++    assert(!atomic_load(&bye_done) && !atomic_load(&sent));
++
++    char endpoint[64], e[512];
++    open_receiver(endpoint,sizeof(endpoint));
++    set_env("UNDS_EVENTS",endpoint);
++    set_env("UNDS_RUMBLE","0");
++    runtime_unds_start(0xb400000);
++    assert(atomic_load(&active) && !runtime_unds_rumble_enabled());
++    assert(receive(e,sizeof(e),500) && has(e,"\"e\":\"hello\"") && field(e,"seq")==0 && field(e,"boot")==1);
++    assert(has(e,"\"exe\":\"u2\"") && has(e,"\"bin\":\"big2-ps4_Shipping.elf\"") && has(e,"\"base\":\"0xb400000\""));
++    assert(field(e,"rumble")==0 && field(e,"pid")>0);
++    expect_seq=1;
++
++    /* rumble and LED: only changes */
++    runtime_unds_rumble(10,20);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"rumble\"") && field(e,"l")==10 && field(e,"s")==20);
++    runtime_unds_rumble(10,20);
++    no_event(30);
++    runtime_unds_rumble(0,0);
++    assert(next_event(e,sizeof(e),500) && field(e,"l")==0 && field(e,"s")==0);
++    runtime_unds_led(0,0,255); runtime_unds_led(0,0,255);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"led\"") && field(e,"b")==255);
++    no_event(30);
++
++    /* pad: first state, stick noise below the deadband, buttons through the limit, analog held */
++    runtime_unds_pad(0,128,128,128,128,0,0);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"pad\"") && field(e,"lx")==128);
++    runtime_unds_pad(0,129,127,128,128,0,0);
++    no_event(30);
++    runtime_unds_pad(0x200,128,128,128,128,0,255);           /* R2 pressed: sent at once */
++    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255);
++    runtime_unds_pad(0x200,128,128,128,128,0,200);           /* analog only, <8 ms later: held */
++    runtime_unds_pad(0x200,128,128,128,128,0,180);
++    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180); /* sent by the heartbeat */
++    runtime_unds_pad(0,128,128,128,128,0,0);                 /* release: at once */
++    assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
++
++    test_audio();
++
++    /* heartbeat: hello every second with counters, refreshes carry re:1 */
++    int hello=0, refresh=0;
++    for (int i=0;i<40 && (!hello || !refresh);++i) {
++        if (!receive(e,sizeof(e),100)) continue;
++        assert((uint32_t)field(e,"seq")==expect_seq); ++expect_seq;
++        if (has(e,"\"e\":\"hello\"")) { hello=1; assert(field(e,"boot")==0 && field(e,"sent")>0 && has(e,"\"ports\":\"0:0:8:1024,17:4:1:256\"")); }
++        if (has(e,"\"re\":1")) refresh=1;
++    }
++    assert(hello && refresh);
++
++    runtime_unds_bye("loadexec");
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"bye\"") && has(e,"\"reason\":\"loadexec\""));
++    runtime_unds_bye("again");
++    runtime_unds_rumble(1,1);
++    char extra[512];
++    assert(!receive(extra,sizeof(extra),600)); /* nothing after bye, not even the heartbeat */
++    runtime_unds_report();
++    assert(!atomic_load(&errors) && !atomic_load(&dropped));
++    puts("unds-test: ok");
++    return 0;
++}
+-- 
+2.34.1
+

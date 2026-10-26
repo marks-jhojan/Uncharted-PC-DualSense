@@ -1,0 +1,25 @@
+UNDS 1.0.0 — DualSense para Uncharted: The Nathan Drake Collection (port uncharted_pc v0.3.9)
+
+USO
+  1. Esta carpeta va dentro de la release oficial del port (uncharted-windows\UNDS\), con el zip de UNDS
+     extraído encima de la oficial v0.3.9.
+  2. Windows: Sonido > Reproducción > Altavoces (Wireless Controller) > Configurar > Cuadrafónico; volumen 100 %.
+  3. Mando DualSense por USB. DSX cerrado.
+  4. Juega como siempre (Uncharted.exe o sus accesos directos): UNDS arranca con el juego en una consola
+     minimizada y se cierra al salir (window = hidden: sin ventana; registro en logs\unds.log). También vale doble clic en UNDS.exe (comprueba memoria y DSX antes).
+     auto = no en unds_launcher.ini: el juego deja de arrancarlo solo.
+
+UNDS STUDIO: doble clic en "UNDS Studio.cmd" (con el juego cerrado y el mando por USB) para calibrar
+gatillos, hápticos y lightbar en el navegador, probándolo en el mando (galería de tiro con R2).
+
+AJUSTES (se recargan al guardar): unds_triggers.ini (gatillos y lightbar), unds_haptics.ini (hápticos),
+unds_launcher.ini (carpeta del juego, comprobaciones, variables para el port).
+
+LIGHTBAR ROJA PARPADEANDO + PITIDO: el port avisó de un problema (la consola dice cuál). Tras un arranque
+defectuoso, cierra el juego y vuelve a abrirlo antes de seguir.
+
+OPCIONES: UNDS.exe --help  (--selftest comprueba el exe). record = yes en unds_launcher.ini graba cada
+partida en recordings\ para reportar fallos.
+
+Código fuente: source\ (parches del port; el bb-probe.exe = tag v0.3.9 + esos parches) y el repositorio
+de UNDS. Licencia GPL-2.0 (LICENSE.txt). Sin archivos del juego: necesitas tu propia copia.

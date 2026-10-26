@@ -1,0 +1,147 @@
+From 307ead1c045f583a8029ff53e63b2bd21b7c63f9 Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 5/8] red_zone: reserve thunk memory before the GPU starts
+
+The red zone thunks must lie within rel32 reach (2 GiB) of the guest
+image. They were looked for in red_zone_patch, after bbgpu_init: in some
+boots the GPU driver's allocations had taken that range, no 1 MiB block
+was free and ~3300 of ~5800 accesses stayed as they were ("3306 left as
+they were" against the usual 46). Their data is lost on a guest page
+fault, and those boots ended badly after a checkpoint (U1, 0.3.9):
+
+  00:28  3306-ish left, 50 x "data may be lost" at 0x5811d4  -> hang
+  14:15  3306 left,     51 x at 0x5811d4  -> iSubMesh assertion
+  14:30  3317 left,     51 x at 0x5811d4  -> read fault at 0x581a90,
+                                             2 KiB from the lost data
+
+red_zone_reserve(), called right after runtime_image_map and before
+bbgpu_init, reserves 16 MiB (MEM_RESERVE only) where the search used to
+look first (64 MiB past the image's end), else right after the image,
+else below it; near_image commits 1 MiB chunks from it and falls back to
+the search only when it is used up. A line after the summary says how
+much was used and how much was found later, so the size can be checked.
+
+Tested under Wine with every free 64 KiB of the image's reach taken
+after the reservation (as the driver may do): 16 of 16 chunks, all in
+reach; without the reservation, 0. BB_RED_ZONE=0 reserves nothing.
+
+On Windows 11 (RTX 3060 Laptop, U1) four boots in a row afterwards:
+"46 left as they were" every time, 1 of the 16 MiB used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01BSA6PfwRNFqNByXwXUktVE
+---
+ src/probe.c    |  3 +++
+ src/red_zone.c | 53 +++++++++++++++++++++++++++++++++++++++++++++-----
+ src/red_zone.h |  6 ++++++
+ 3 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/src/probe.c b/src/probe.c
+index 76eb2a9..4911a1d 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -1212,6 +1212,9 @@ int main(int argc, char **argv) {
+     }
+     image = runtime_image_map(round_page(size), PROT_READ | PROT_WRITE);
+     if (!image) image = allocate(round_page(size));
++#ifdef _WIN32
++    red_zone_reserve(image, round_page(size)); /* before bbgpu_init: the driver's allocations may fill its reach */
++#endif
+     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
+     fclose(f);
+     if (!cpu_only) {
+diff --git a/src/red_zone.c b/src/red_zone.c
+index 8c3cd41..322d4cb 100644
+--- a/src/red_zone.c
++++ b/src/red_zone.c
+@@ -176,14 +176,52 @@ static Function *find_functions(size_t *count) {
+     return functions;
+ }
+ 
++/* Thunk memory reserved before the GPU starts (red_zone_reserve): committed chunk by chunk. */
++enum { RESERVE=16<<20 };
++static unsigned char *reserved;
++static size_t reserved_size, reserved_used, chunks_outside;
++/* rel32 reach: every byte of [at, at+size) within 2 GiB (less a margin) of every byte of the image. */
++static int in_reach(uint64_t base, uint64_t size, uint64_t at, uint64_t length) {
++    const uint64_t reach=UINT64_C(0x7ff00000);
++    if (at>=base) return at+length-base<reach;
++    return at>=0x10000 && base+size-at<reach;
++}
++/* First free range of `length` in reach: above the image (from 64 MiB past its end, as before,
++ * then right after it), then below it. MEM_RESERVE only when `commit` is 0. */
++static unsigned char *find_near(uint64_t base, uint64_t size, size_t length, int commit) {
++    const DWORD type=commit ? MEM_RESERVE|MEM_COMMIT : MEM_RESERVE;
++    const DWORD protect=commit ? PAGE_EXECUTE_READWRITE : PAGE_NOACCESS;
++    const uint64_t starts[2]={(base+size+(64u<<20)+0xffff)&~(uint64_t)0xffff,(base+size+0xffff)&~(uint64_t)0xffff};
++    for (int s=0;s<2;++s)
++        for (uint64_t at=starts[s]; in_reach(base,size,at,length); at+=1u<<16) {
++            if (s==1 && at>=starts[0]) break;
++            void *p=VirtualAlloc((void *)(uintptr_t)at,length,type,protect);
++            if (p) return p;
++        }
++    if (base>=length+0x10000)
++        for (uint64_t at=(base-length)&~(uint64_t)0xffff; in_reach(base,size,at,length); at-=1u<<16) {
++            void *p=VirtualAlloc((void *)(uintptr_t)at,length,type,protect);
++            if (p) return p;
++            if (at<(1u<<16)+0x10000) break;
++        }
++    return NULL;
++}
++void red_zone_reserve(unsigned char *base, uint64_t size) {
++    const char *mode=getenv("BB_RED_ZONE");
++    if ((mode && !strcmp(mode,"0")) || reserved || !base) return;
++    reserved=find_near((uint64_t)(uintptr_t)base,size,RESERVE,0);
++    if (reserved) reserved_size=RESERVE;
++    else printf("Red zone: no %d MiB free near the image before the GPU starts; thunk memory is looked for later\n",RESERVE>>20);
++}
+ /* Thunk memory: within rel32 reach of the whole image. */
+ static unsigned char *near_image(size_t size) {
+-    const uint64_t base=(uint64_t)(uintptr_t)image, start=(base+image_size+(64u<<20)+0xffff)&~(uint64_t)0xffff;
+-    for (uint64_t at=start; at+size-base<UINT64_C(0x7ff00000); at+=1u<<16) {
+-        void *p=VirtualAlloc((void *)(uintptr_t)at,size,MEM_RESERVE|MEM_COMMIT,PAGE_EXECUTE_READWRITE);
+-        if (p) return p;
++    if (reserved && reserved_used+size<=reserved_size) {
++        void *p=VirtualAlloc(reserved+reserved_used,size,MEM_COMMIT,PAGE_EXECUTE_READWRITE);
++        if (p) { reserved_used+=size; return p; }
+     }
+-    return NULL;
++    unsigned char *p=find_near((uint64_t)(uintptr_t)image,image_size,size,1);
++    if (p) ++chunks_outside;
++    return p;
+ }
+ static unsigned char *thunk_reserve(void) {
+     if (chunk_used+REGION_MAX>CHUNK) {
+@@ -443,6 +481,11 @@ void red_zone_patch(unsigned char *base, uint64_t size, const RedZoneSegment *se
+            "128 bytes lower (%u jumps, %u moved neighbours), %u left as they were; skipped: %u with calls, "
+            "%u with indirect jumps, %u with exception tables, %u with data in their code\n",
+            st.red,st.functions,st.accesses,st.jumps,st.moved,st.left,st.calls,st.indirect,st.lsda,st.undecodable);
++    if (reserved)
++        printf("Red zone: thunk memory %zu of %zu MiB reserved before the GPU at %p, %zu MiB found later\n",
++               reserved_used>>20,reserved_size>>20,(void *)reserved,chunks_outside*(size_t)(CHUNK>>20));
++    else
++        printf("Red zone: thunk memory found after the GPU started: %zu MiB\n",chunks_outside*(size_t)(CHUNK>>20));
+     free(items);
+     free(targets);
+     free(functions);
+diff --git a/src/red_zone.h b/src/red_zone.h
+index a602e2e..3026948 100644
+--- a/src/red_zone.h
++++ b/src/red_zone.h
+@@ -7,6 +7,12 @@
+ /* A loaded segment: offset in the image, size, ELF flags (1 execute, 2 write, 4 read). */
+ typedef struct { uint64_t address, size, flags; } RedZoneSegment;
+ 
++/* Right after the image is mapped, before the GPU starts: reserves thunk memory within rel32
++ * reach of the image while the address space around it is still empty. Started after the GPU,
++ * the search found no free 1 MiB block in some boots (the driver's allocations had taken the
++ * range) and thousands of accesses stayed as they were: their data was lost on faults (crashes
++ * and hangs after checkpoints). Reserved only; committed as red_zone_patch uses it. */
++void red_zone_reserve(unsigned char *image, uint64_t image_size);
+ /* Before guest code runs (the image still writable, after every other code patch): the memory
+  * accesses of functions that keep data below rsp run from thunks with rsp 128 bytes lower.
+  * BB_RED_ZONE=0 turns it off, BB_RED_ZONE=list prints each function and access. */
+-- 
+2.34.1
+

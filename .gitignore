@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+recordings/
+*.jsonl
+companion/unds_launcher.local.ini
+logs/
+studio_backup/

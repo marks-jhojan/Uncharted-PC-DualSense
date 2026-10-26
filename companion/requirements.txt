@@ -1,0 +1,4 @@
+# UNDS companion (Windows 11, Python 3.10+; probado con 3.12)
+numpy>=1.24          # síntesis de hápticos
+sounddevice>=0.5     # WASAPI (trae PortAudio en la rueda de Windows)
+# hidapi>=0.14       # OPCIONAL desde el Día 8: solo para --backend hid y el rescate si el port muere sin bye

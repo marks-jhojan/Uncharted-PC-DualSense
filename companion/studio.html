@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UNDS Studio</title>
+<style>
+:root{
+  --bg:#0a0b0d; --panel:#111316; --card:#16191d; --card2:#1c2025; --line:#262a30; --line2:#323740;
+  --text:#efe9dc; --muted:#8f8a80; --dim:#5f5b55;
+  --gold:#e7c36a; --gold2:#f6dc95; --golddim:#8a7440; --rust:#c8643b; --teal:#4fc3b4; --tealdim:#21564f;
+  --red:#e0574a; --ok:#7bc47f;
+  --led: rgb(128,128,0);
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI Variable Text","Segoe UI",system-ui,sans-serif}
+body{min-height:100vh;background:
+  radial-gradient(1200px 500px at 85% -10%, rgba(231,195,106,.07), transparent 60%),
+  radial-gradient(900px 600px at -10% 110%, rgba(79,195,180,.05), transparent 60%), var(--bg)}
+button,select,input{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid var(--line2);background:var(--card2);border-radius:8px;padding:6px 12px;transition:.15s}
+button:hover{border-color:var(--golddim);background:#22262c}
+button.primary{background:linear-gradient(180deg,#e9c870,#c9a24c);color:#1a1405;border-color:#c9a24c;font-weight:600}
+button.primary:hover{filter:brightness(1.08)}
+button.ghost{background:transparent}
+button.small{padding:3px 9px;font-size:12px;border-radius:6px}
+button:disabled{opacity:.45;cursor:default}
+input[type=text]{background:#0e1013;border:1px solid var(--line2);border-radius:7px;padding:6px 9px;width:100%}
+input[type=text]:focus{outline:none;border-color:var(--gold)}
+select{background:#0e1013;border:1px solid var(--line2);border-radius:7px;padding:5px 8px}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:22px;background:transparent}
+input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:linear-gradient(90deg,var(--gold) var(--p,50%),#2b3037 var(--p,50%))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--gold2);margin-top:-5.5px;box-shadow:0 0 0 3px rgba(231,195,106,.18)}
+input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:#2b3037}
+input[type=range]::-moz-range-progress{height:4px;border-radius:2px;background:var(--gold)}
+input[type=range]::-moz-range-thumb{width:14px;height:14px;border:0;border-radius:50%;background:var(--gold2)}
+
+/* --- cabecera --- */
+header{position:sticky;top:0;z-index:20;background:rgba(10,11,13,.86);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.ledbar{height:3px;background:var(--led);box-shadow:0 0 18px 2px var(--led);transition:background .08s,box-shadow .08s}
+.head{display:flex;align-items:center;gap:16px;padding:10px 20px}
+.brand{display:flex;align-items:baseline;gap:10px}
+.brand b{font-size:19px;letter-spacing:.14em;color:var(--gold)}
+.brand span{color:var(--muted);font-size:12px;letter-spacing:.2em;text-transform:uppercase}
+.pills{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.pill{display:flex;align-items:center;gap:7px;padding:4px 10px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:12px;color:var(--muted)}
+.pill i{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+.pill.on i{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.pill.warn i{background:var(--rust);box-shadow:0 0 8px var(--rust)}
+.pill.on{color:var(--text)}
+
+/* --- disposición --- */
+main{display:grid;grid-template-columns:400px 1fr;gap:18px;padding:18px 20px 40px;max-width:1500px;margin:0 auto}
+@media (max-width:1100px){main{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px}
+.panel h2{margin:0 0 12px;font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--muted);font-weight:600;display:flex;align-items:center;gap:8px}
+.panel h2 .grow{flex:1}
+.stack{display:flex;flex-direction:column;gap:18px}
+
+/* --- gatillos en vivo --- */
+.triggers{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.trig{display:flex;flex-direction:column;align-items:center;gap:8px}
+.trig .name{font-weight:700;letter-spacing:.18em;color:var(--gold)}
+.trig .eff{font-family:var(--mono);font-size:11.5px;color:var(--muted);text-align:center;min-height:32px}
+.rail{position:relative;width:118px;height:290px;border-radius:16px 16px 26px 26px;background:linear-gradient(180deg,#15181c,#0d0f12);border:1px solid var(--line2);overflow:hidden;box-shadow:inset 0 8px 24px rgba(0,0,0,.5)}
+.zone{position:absolute;left:0;right:0;border-top:1px solid rgba(255,255,255,.035)}
+.zone .f{position:absolute;inset:0;background:var(--gold);opacity:0;transition:opacity .12s}
+.zone .v{position:absolute;inset:0;opacity:0;background:repeating-linear-gradient(135deg,var(--teal) 0 5px,transparent 5px 11px);background-size:16px 16px;animation:buzz .35s linear infinite;transition:opacity .12s}
+@keyframes buzz{to{background-position:16px 0}}
+.zone .lab{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:10px;color:rgba(255,255,255,.22);font-family:var(--mono)}
+.breakline{position:absolute;left:-2px;right:-2px;height:0;border-top:2px dashed var(--red);display:none}
+.breakline::after{content:"rompe";position:absolute;left:6px;top:1px;font-size:10px;color:var(--red);letter-spacing:.1em}
+.finger{position:absolute;left:0;right:0;top:0;height:0;background:linear-gradient(180deg,rgba(246,220,149,.06),rgba(246,220,149,.28));border-bottom:2px solid var(--gold2);box-shadow:0 6px 18px rgba(246,220,149,.35);transition:height .04s linear}
+.thresh{position:absolute;left:0;right:0;border-top:1px dotted rgba(255,255,255,.45)}
+.thresh::after{content:attr(data-l);position:absolute;left:5px;top:-14px;font-size:10px;color:var(--muted);font-family:var(--mono)}
+.trig .val{font-family:var(--mono);font-size:12px;color:var(--text)}
+.note{font-size:11.5px;color:var(--dim)}
+
+/* --- galería --- */
+.gallery{position:relative;overflow:hidden}
+.flash{position:absolute;inset:0;pointer-events:none;background:radial-gradient(400px 200px at 70% 30%,rgba(255,214,140,.35),transparent 70%);opacity:0;transition:opacity .2s}
+.flash.on{opacity:1;transition:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:99px;border:1px solid var(--line2);background:var(--card);font-size:12.5px;cursor:pointer;user-select:none;transition:.15s}
+.chip:hover{border-color:var(--golddim)}
+.chip.sel{background:linear-gradient(180deg,rgba(231,195,106,.22),rgba(231,195,106,.08));border-color:var(--gold);color:var(--gold2)}
+.chip small{color:var(--muted)}
+.chip svg{width:16px;height:16px;fill:currentColor;opacity:.85}
+.ammo{display:flex;align-items:center;gap:14px;margin-top:14px}
+.mag{display:flex;flex-wrap:wrap;gap:3px;max-width:260px}
+.mag i{width:6px;height:16px;border-radius:2px 2px 1px 1px;background:linear-gradient(180deg,var(--gold2),var(--golddim))}
+.mag i.out{background:#2a2e34}
+.bigcount{font-family:var(--mono);font-size:30px;color:var(--gold);min-width:84px}
+.state{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.tag{font-size:11px;letter-spacing:.14em;text-transform:uppercase;padding:3px 8px;border-radius:5px;border:1px solid var(--line2);color:var(--dim)}
+.tag.on{color:#14110a;background:var(--gold);border-color:var(--gold)}
+.tag.red.on{background:var(--red);border-color:var(--red);color:#fff}
+.tag.teal.on{background:var(--teal);border-color:var(--teal)}
+.log{margin-top:12px;font-family:var(--mono);font-size:11px;color:var(--muted);max-height:96px;overflow:auto;border-top:1px solid var(--line);padding-top:8px}
+.log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* --- pestañas --- */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:-4px -4px 16px;padding:0 4px}
+.tab{padding:9px 14px;border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--muted);letter-spacing:.05em}
+.tab:hover{background:none;color:var(--text)}
+.tab.sel{color:var(--gold2);border-bottom-color:var(--gold)}
+.view{display:none}.view.sel{display:block}
+.sub{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.sub .title{font-size:20px;font-weight:600}
+.sub .title small{font-size:13px;color:var(--muted);font-weight:400;margin-left:6px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+
+/* --- tarjetas de efecto --- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;position:relative}
+.card h3{margin:0 0 2px;font-size:14.5px;display:flex;align-items:center;gap:8px}
+.card .hint{font-size:12px;color:var(--muted);margin-bottom:10px}
+.origin{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:5px;border:1px solid var(--line2);color:var(--muted);margin-left:auto;white-space:nowrap}
+.origin.mine{border-color:var(--gold);color:var(--gold)}
+.row{display:grid;grid-template-columns:96px 1fr 38px;align-items:center;gap:10px;margin:2px 0}
+.row label{font-size:12.5px;color:var(--muted)}
+.row output{font-family:var(--mono);font-size:12.5px;text-align:right}
+.modes{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0 10px}
+.mode{font-size:11.5px;padding:3px 8px;border-radius:6px;border:1px solid var(--line2);background:#0f1114;cursor:pointer;color:var(--muted)}
+.mode.sel{border-color:var(--gold);color:var(--gold2);background:rgba(231,195,106,.1)}
+.strip{display:grid;grid-template-columns:repeat(10,1fr);gap:3px;height:34px;margin:8px 0 6px}
+.strip div{position:relative;border-radius:4px;background:#0e1013;overflow:hidden;border:1px solid #20242a}
+.strip div b{position:absolute;left:0;right:0;bottom:0;background:var(--gold)}
+.strip div s{position:absolute;inset:0;background:repeating-linear-gradient(135deg,var(--teal) 0 3px,transparent 3px 7px);opacity:0}
+.strip div.brk{border-right:2px solid var(--red)}
+.code{font-family:var(--mono);font-size:12px;color:var(--gold2);background:#0d0f12;border:1px solid var(--line);border-radius:7px;padding:5px 8px;display:flex;align-items:center;gap:8px}
+.code input{border:0;background:none;padding:0;color:var(--gold2);font-family:var(--mono);font-size:12px}
+.actions{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.err{color:var(--red);font-size:12px;margin-top:6px;min-height:0}
+
+/* --- línea de tiempo del retroceso --- */
+.timeline{display:flex;height:46px;border-radius:9px;overflow:hidden;border:1px solid var(--line2);margin:10px 0}
+.phase{position:relative;display:flex;flex-direction:column;justify-content:center;padding:0 8px;font-size:11px;cursor:pointer;min-width:42px;border-right:1px solid rgba(0,0,0,.4);overflow:hidden;white-space:nowrap}
+.phase b{font-weight:600;font-size:11px}
+.phase span{font-family:var(--mono);opacity:.75}
+.phase.sel{outline:2px solid var(--gold2);outline-offset:-2px}
+.phase.FEEDBACK,.phase.SLOPE_FEEDBACK,.phase.MULTIPLE_POSITION_FEEDBACK{background:linear-gradient(180deg,#8f7637,#5d4c22)}
+.phase.WEAPON{background:linear-gradient(180deg,#a2553a,#653423)}
+.phase.VIBRATION,.phase.MULTIPLE_POSITION_VIBRATION,.phase.MACHINE{background:repeating-linear-gradient(135deg,#2f7d74 0 6px,#25645d 6px 12px)}
+.phase.OFF{background:#24282e;color:var(--muted)}
+.phase.rest{flex:1;background:repeating-linear-gradient(90deg,#15181c 0 8px,#121418 8px 16px);color:var(--dim);cursor:default}
+
+/* --- voces --- */
+canvas.wave{width:100%;height:110px;display:block;background:#0c0e11;border:1px solid var(--line);border-radius:9px}
+.layer{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:10px;background:#13161a}
+.layer .lh{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.seg{display:inline-flex;border:1px solid var(--line2);border-radius:7px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:3px 10px;font-size:12px;background:#0f1114;color:var(--muted)}
+.seg button.sel{background:var(--gold);color:#16120a}
+.voicepick{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+
+/* --- brújula de daño --- */
+.compass{position:relative;width:280px;height:280px;margin:6px auto;cursor:crosshair;user-select:none}
+.compass svg{width:100%;height:100%}
+.meter{display:grid;grid-template-columns:28px 1fr 40px;gap:8px;align-items:center;font-size:12px;color:var(--muted);margin:4px 0}
+.meter .bar{height:10px;border-radius:5px;background:#0e1013;overflow:hidden}
+.meter .bar b{display:block;height:100%;background:linear-gradient(90deg,var(--golddim),var(--gold2));width:0;transition:width .25s}
+
+/* --- rumble pad --- */
+.motors{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.motor{background:#0e1013;border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.motor .knob{position:relative;width:96px;height:96px;margin:6px auto;border-radius:50%;border:2px solid var(--line2);background:conic-gradient(var(--gold) var(--a,0deg),#1b1f24 0)}
+.motor .knob span{position:absolute;inset:12px;border-radius:50%;background:#0e1013;display:grid;place-items:center;font-family:var(--mono);font-size:18px;color:var(--gold2)}
+.hold{user-select:none;touch-action:none}
+.hold.active{background:var(--gold);color:#16120a}
+
+/* --- lightbar --- */
+.swatches{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.sw{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card)}
+.sw .c{height:62px;position:relative}
+.sw .c::after{content:"";position:absolute;left:12%;right:12%;bottom:10px;height:6px;border-radius:3px;background:inherit;filter:blur(6px) brightness(1.4)}
+.sw .b{padding:8px 10px;font-size:12px}
+.sw input[type=color]{width:100%;height:28px;border:0;background:none;padding:0;cursor:pointer}
+
+/* --- avanzado --- */
+.adv input[type=text]{font-family:var(--mono);font-size:12px;padding:4px 7px}
+.adv table{width:100%;border-collapse:collapse;table-layout:fixed}
+.adv col.k{width:190px}.adv col.v{width:36%}
+.adv td{padding:5px 6px;border-bottom:1px solid #1d2126;vertical-align:top}
+.adv td.k{font-family:var(--mono);font-size:12px;color:var(--gold2);white-space:nowrap;width:1%}
+.adv td.d{font-size:11.5px;color:var(--muted);max-width:420px}
+.adv h4{margin:16px 0 6px;font-size:12px;letter-spacing:.18em;color:var(--muted);text-transform:uppercase}
+
+/* --- avisos --- */
+#toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:50}
+.toast{background:#1d2126;border:1px solid var(--line2);border-left:3px solid var(--gold);padding:9px 13px;border-radius:8px;max-width:420px;font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.4);animation:in .2s}
+.toast.bad{border-left-color:var(--red)}
+@keyframes in{from{transform:translateY(8px);opacity:0}}
+.banner{display:none;margin:0 20px;padding:10px 14px;border-radius:10px;border:1px solid #5a3a22;background:#22170f;color:#f0c9a8;font-size:13px}
+.banner.on{display:block}
+kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;padding:0 5px;color:var(--text)}
+</style>
+</head>
+<body>
+<header>
+  <div class="ledbar" id="ledbar"></div>
+  <div class="head">
+    <div class="brand"><b>UNDS</b><span>Studio</span></div>
+    <div class="note" id="files"></div>
+    <div class="pills">
+      <div class="pill" id="pPad"><i></i><span>Mando</span></div>
+      <div class="pill" id="pHap"><i></i><span>Hápticos</span></div>
+      <div class="pill" id="pGame"><i></i><span>Juego</span></div>
+      <button class="small ghost" id="bRelease" title="Gatillos libres, sin vibración">Soltar mando</button>
+      <button class="small ghost" id="bRestore" title="Vuelve los .ini a como estaban al abrir el Studio">Restaurar</button>
+    </div>
+  </div>
+</header>
+<div class="banner" id="banner"></div>
+
+<main>
+  <div class="stack">
+    <section class="panel">
+      <h2>Mando en vivo <span class="grow"></span><span class="note" id="padwhy"></span></h2>
+      <div class="triggers">
+        <div class="trig"><div class="name">L2</div><div class="rail" id="railL"></div><div class="val" id="valL">0</div><div class="eff" id="effL">—</div></div>
+        <div class="trig"><div class="name">R2</div><div class="rail" id="railR"></div><div class="val" id="valR">0</div><div class="eff" id="effR">—</div></div>
+      </div>
+      <p class="note" style="margin:10px 0 0">Dorado = resistencia · franjas = vibración · línea roja = donde se rompe el tope · línea punteada = donde el juego da el gatillo por pulsado. La posición del dedo es aproximada (la escala del gatillo no es lineal).</p>
+    </section>
+
+    <section class="panel gallery" id="gallery">
+      <div class="flash" id="flash"></div>
+      <h2>Galería de tiro <span class="grow"></span>
+        <label style="display:flex;align-items:center;gap:6px;text-transform:none;letter-spacing:0;font-size:12px"><input type="checkbox" id="rangeOn" checked> activa</label></h2>
+      <div class="chips" id="weaponChips"></div>
+      <div class="ammo">
+        <div class="bigcount" id="ammoCount">8</div>
+        <div class="mag" id="mag"></div>
+      </div>
+      <div class="state">
+        <span class="tag" id="tAim">apuntando</span>
+        <span class="tag" id="tFire">disparando</span>
+        <span class="tag teal" id="tAuto">automática</span>
+        <span class="tag red" id="tReload">recargando</span>
+        <span class="tag red" id="tEmpty">vacío</span>
+        <button class="small" id="bReload" style="margin-left:auto">Recargar <kbd>□</kbd></button>
+      </div>
+      <p class="note" style="margin:10px 0 0">Aprieta <kbd>L2</kbd> para apuntar y <kbd>R2</kbd> para disparar en el mando: se siente igual que en el juego con el arma elegida. <kbd>□</kbd> recarga.</p>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="tabs">
+      <button class="tab sel" data-v="vTrig">Gatillos</button>
+      <button class="tab" data-v="vHap">Hápticos</button>
+      <button class="tab" data-v="vHit">Daño y muerte</button>
+      <button class="tab" data-v="vLed">Lightbar</button>
+      <button class="tab" data-v="vAdv">Avanzado</button>
+    </div>
+
+    <div class="view sel" id="vTrig">
+      <div class="sub"><div class="title" id="trigTitle">Pistola</div>
+        <div id="trigType" style="display:flex;gap:6px;align-items:center;margin-left:auto"></div></div>
+      <p class="note" id="trigScope" style="margin:-6px 0 14px"></p>
+      <div class="grid2" id="trigCards"></div>
+    </div>
+
+    <div class="view" id="vHap">
+      <div class="sub"><div class="title">Voces hápticas</div><span class="note">Suenan en los actuadores del mando (canales 3-4 por USB).</span></div>
+      <div class="voicepick" id="voicePick"></div>
+      <div class="card" id="voiceCard"></div>
+      <div class="card" style="margin-top:14px">
+        <h3>Rumble del juego → hápticos</h3>
+        <div class="hint">El juego de PS4 solo manda dos motores (grande y pequeño). Así se traducen a los actuadores. Mantén pulsado un motor para sentirlo.</div>
+        <div class="motors">
+          <div class="motor"><div class="note">Motor grande</div><div class="knob" id="knobL">0</div><input type="range" min="0" max="255" value="160" id="mL"><button class="hold" data-m="L">Mantener</button></div>
+          <div class="motor"><div class="note">Motor pequeño</div><div class="knob" id="knobS">0</div><input type="range" min="0" max="255" value="200" id="mS"><button class="hold" data-m="S">Mantener</button></div>
+        </div>
+        <div id="rumbleParams" style="margin-top:12px"></div>
+      </div>
+    </div>
+
+    <div class="view" id="vHit">
+      <div class="grid2">
+        <div class="card">
+          <h3>Daño direccional</h3>
+          <div class="hint">Haz clic alrededor de Drake: el golpe llega desde ahí (delante agudo, detrás grave, a los lados por su actuador).</div>
+          <div class="compass" id="compass"></div>
+          <div class="row"><label>Daño</label><input type="range" min="1" max="100" value="60" id="hitAmt"><output id="hitAmtO">60</output></div>
+          <div class="meter"><span>Izq</span><div class="bar"><b id="mixL"></b></div><span id="mixLo">0</span></div>
+          <div class="meter"><span>Der</span><div class="bar"><b id="mixR"></b></div><span id="mixRo">0</span></div>
+          <div class="note" id="mixNames"></div>
+        </div>
+        <div class="card"><h3>Cómo se reparte</h3><div class="hint">Ajustes del golpe (unds_haptics.ini, [default]).</div><div id="hitParams"></div></div>
+        <div class="card">
+          <h3>Muerte</h3><div class="hint">Golpe fuerte + retumbe que se apaga, con la lightbar en rojo.</div>
+          <div class="actions"><button class="primary" id="bDeath">Simular muerte</button><button id="bDeathEdit">Editar la voz</button></div>
+          <div id="deathParams" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" id="vLed">
+      <div class="sub"><div class="title">Lightbar</div><span class="note">El juego usa colores tenues; el companion los multiplica por la ganancia.</span></div>
+      <div class="card" style="margin-bottom:14px"><div id="ledParams"></div></div>
+      <div class="swatches" id="swatches"></div>
+    </div>
+
+    <div class="view adv" id="vAdv">
+      <div class="sub"><div class="title">Todos los parámetros</div>
+        <input type="text" id="advFilter" placeholder="Buscar clave o texto…" style="max-width:280px;margin-left:auto"></div>
+      <p class="note">Cada cambio se valida y se guarda al pulsar <kbd>Enter</kbd> o al salir del campo. Con el juego abierto, el companion lo recarga solo.</p>
+      <div id="advBody"></div>
+    </div>
+  </section>
+</main>
+<div id="toasts"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const api = async (path, body) => {
+  const r = await fetch(path, body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
+};
+const toast = (text, bad = false) => {
+  const t = el("div", {class: "toast" + (bad ? " bad" : "")}, text);
+  $("#toasts").append(t); setTimeout(() => t.remove(), bad ? 6000 : 2600);
+};
+const debounce = (fn, ms) => { let h; return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); }; };
+const setP = r => r.style.setProperty("--p", ((r.value - r.min) / (r.max - r.min) * 100) + "%");
+
+let M = null;                 // modelo del servidor
+const MODE_LABEL = {OFF: "Libre", FEEDBACK: "Resistencia", WEAPON: "Tope", VIBRATION: "Vibración", SLOPE_FEEDBACK: "Rampa",
+  MULTIPLE_POSITION_FEEDBACK: "Por zonas", MULTIPLE_POSITION_VIBRATION: "Vibra por zonas", MACHINE: "Máquina"};
+let SEL = {cls: "pistola", wid: ""};
+let LIVE = null;
+const CLASS_LABEL = {pistola: "Pistola", revolver: "Revólver", subfusil: "Subfusil", automatica: "Fusil automático",
+  escopeta: "Escopeta", lanzagranadas: "Lanzagranadas", torreta: "Torreta", granada: "Granada"};
+const ICON = {
+  pistola: "M3 9h13l1-2h3v4h-3l-1 1h-3l-1 6H8l1-6H3z",
+  revolver: "M2 9h11l1-2h4l2 2v2h-4l-2 1h-1l-1 6H7l1-6H2z M14 8.5h3v1h-3z",
+  subfusil: "M2 9h16v3h-5l-1 3h-2l1-3H8l-1 6H4l1-6H2z M11 12h2v5h-2z",
+  automatica: "M1 9h18l2 1v2h-6l-2 2h-2l1-2H8l-2 6H3l2-6H1z M12 12h2v6h-2z",
+  escopeta: "M1 9h20v2H9l-3 7H3l2-7H1z M10 11h4v2h-4z",
+  lanzagranadas: "M2 8h12a3 3 0 0 1 3 3H8l-2 7H3l2-7H2z M14 6h6v6h-6z",
+  torreta: "M3 6h16v3H3z M9 9h4v4H9z M5 13h12l1 5H4z",
+  granada: "M11 3h3v2h-3z M12.5 6a6 6 0 1 1 0 12a6 6 0 0 1 0-12z",
+};
+const icon = cls => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  s.setAttribute("viewBox", "0 0 22 22"); const p = document.createElementNS(s.namespaceURI, "path");
+  p.setAttribute("d", ICON[cls] || ICON.pistola); s.append(p); return s; };
+
+// ---------- efectos de gatillo ----------
+function parseEffect(text) {
+  const parts = String(text || "OFF").trim().split(/[\s,]+/);
+  const alias = {SLOPE: "SLOPE_FEEDBACK", MPF: "MULTIPLE_POSITION_FEEDBACK", MPV: "MULTIPLE_POSITION_VIBRATION", VIB: "VIBRATION"};
+  const name = alias[parts[0].toUpperCase()] || parts[0].toUpperCase();
+  return {name, params: parts.slice(1).map(Number)};
+}
+function zones(eff) {
+  const z = Array.from({length: 10}, () => ({f: 0, v: 0})); let brk = null; const p = eff.params;
+  switch (eff.name) {
+    case "FEEDBACK": for (let i = p[0]; i < 10; i++) z[i].f = p[1]; break;
+    case "WEAPON": for (let i = p[0]; i < p[1]; i++) z[i].f = p[2]; brk = p[1]; break;
+    case "VIBRATION": for (let i = p[0]; i < 10; i++) z[i].v = p[1]; break;
+    case "SLOPE_FEEDBACK": { const [s, e, a, b] = p, k = (b - a) / (e - s);
+      for (let i = s; i < 10; i++) z[i].f = i <= e ? Math.round(a + k * (i - s)) : b; break; }
+    case "MULTIPLE_POSITION_FEEDBACK": p.forEach((v, i) => z[i] && (z[i].f = v)); break;
+    case "MULTIPLE_POSITION_VIBRATION": p.slice(1).forEach((v, i) => z[i] && (z[i].v = v)); break;
+    case "MACHINE": for (let i = p[0]; i <= p[1]; i++) { z[i].f = Math.max(p[2], p[3]); z[i].v = Math.abs(p[2] - p[3]) || 1; } break;
+  }
+  return {z, brk};
+}
+function defaultParams(name) {
+  const r = M.modes[name].ranges;
+  const pick = {FEEDBACK: [3, 4], WEAPON: [3, 4, 6], VIBRATION: [1, 4, 40], SLOPE_FEEDBACK: [2, 7, 2, 8],
+    MACHINE: [1, 9, 7, 1, 30, 1]}[name];
+  return pick || r.map(([lo, hi]) => name.startsWith("MULTIPLE") ? Math.min(hi, Math.max(lo, 3)) : lo);
+}
+
+// rail en vivo
+function buildRail(id) {
+  const rail = $(id); rail.innerHTML = "";
+  for (let i = 0; i < 10; i++) {
+    const z = el("div", {class: "zone", style: `top:${i * 10}%;height:10%`}, el("div", {class: "f"}), el("div", {class: "v"}), el("span", {class: "lab"}, String(i)));
+    rail.append(z);
+  }
+  rail.append(el("div", {class: "breakline"}), el("div", {class: "thresh"}), el("div", {class: "finger"}));
+}
+function paintRail(id, text, analog, thresh) {
+  const rail = $(id); const eff = parseEffect(text); const {z, brk} = zones(eff);
+  rail.querySelectorAll(".zone").forEach((zone, i) => {
+    zone.querySelector(".f").style.opacity = z[i].f ? (0.18 + z[i].f / 8 * 0.72) : 0;
+    zone.querySelector(".v").style.opacity = z[i].v ? (0.25 + z[i].v / 8 * 0.6) : 0;
+  });
+  const bl = rail.querySelector(".breakline");
+  bl.style.display = brk != null ? "block" : "none"; if (brk != null) bl.style.top = (brk * 10) + "%";
+  rail.querySelector(".finger").style.height = (analog / 255 * 100) + "%";
+  const th = rail.querySelector(".thresh"); th.style.top = (thresh / 255 * 100) + "%"; th.dataset.l = thresh;
+}
+
+// editor de efecto reutilizable
+function effectEditor({value, onChange, compact = false}) {
+  let eff = parseEffect(value);
+  const box = el("div");
+  const modes = el("div", {class: "modes"});
+  const sliders = el("div");
+  const strip = el("div", {class: "strip"});
+  const codeIn = el("input", {type: "text", value});
+  const code = el("div", {class: "code"}, el("span", {style: "color:var(--dim)"}, "ini"), codeIn);
+  const help = el("div", {class: "note", style: "margin-top:4px"});
+  const emit = debounce(() => onChange(text()), 280);
+  const text = () => eff.name === "OFF" ? "OFF" : [eff.name, ...eff.params].join(" ");
+  function render() {
+    modes.innerHTML = "";
+    for (const name of Object.keys(M.modes)) {
+      modes.append(el("span", {class: "mode" + (name === eff.name ? " sel" : ""), title: `${name}: ${M.modes[name].help}`,
+        onclick: () => { eff = {name, params: defaultParams(name)}; render(); emit(); }},
+        MODE_LABEL[name] || name));
+    }
+    sliders.innerHTML = "";
+    const spec = M.modes[eff.name];
+    if (spec) spec.ranges.forEach(([lo, hi], i) => {
+      if (eff.params[i] == null) eff.params[i] = lo;
+      const r = el("input", {type: "range", min: lo, max: hi, value: eff.params[i]}); setP(r);
+      const o = el("output", {}, String(eff.params[i]));
+      r.addEventListener("input", () => { eff.params[i] = +r.value; o.textContent = r.value; setP(r); drawStrip(); codeIn.value = text(); emit(); });
+      sliders.append(el("div", {class: "row"}, el("label", {}, spec.labels[i] || `p${i + 1}`), r, o));
+    });
+    help.textContent = spec ? spec.help : "Modo heredado de DSX v2: edítalo como texto.";
+    drawStrip(); codeIn.value = text();
+  }
+  function drawStrip() {
+    const {z, brk} = zones(eff); strip.innerHTML = "";
+    z.forEach((c, i) => {
+      const d = el("div", {class: brk === i + 1 ? "brk" : ""}, el("b", {style: `height:${c.f / 8 * 100}%`}), el("s", {style: `opacity:${c.v ? .3 + c.v / 8 * .6 : 0}`}));
+      strip.append(d);
+    });
+  }
+  codeIn.addEventListener("change", () => { eff = parseEffect(codeIn.value); render(); onChange(text()); });
+  box.append(modes, strip, sliders, code, help);
+  render();
+  box.getText = text;
+  return box;
+}
+
+// ---------- pestaña Gatillos ----------
+const TRIG_CARDS = [
+  {key: "l2", title: "L2 · apuntar", hint: "Peso del gatillo izquierdo con un arma en la mano.", side: "L"},
+  {key: "r2_idle", title: "R2 · sin apuntar", hint: "Tope del gatillo derecho disparando desde la cadera.", side: "R"},
+  {key: "r2_aim", title: "R2 · apuntando", hint: "Tope con L2 pulsado: para apoyar el dedo y romperlo al disparar.", side: "R"},
+  {key: "empty_r2", title: "R2 · cargador vacío", hint: "Lo que siente el dedo sin balas.", side: "R"},
+];
+function originBadge(o) {
+  const txt = {arma: "esta arma", clase: "esta clase", "clase-código": "clase (fábrica)", general: "general", "código": "fábrica"}[o] || o;
+  return el("span", {class: "origin" + (o === "arma" || o === "clase" ? " mine" : "")}, txt);
+}
+function scopeSection() { return SEL.wid ? `arma ${SEL.wid}` : `clase ${SEL.cls}`; }
+function trigValues() { return SEL.wid ? M.weaponValues[SEL.wid] : M.classValues[SEL.cls]; }
+async function save(file, section, key, value) {
+  const r = await api("/api/set", {file, section, key, value});
+  if (!r.ok) { toast(r.error, true); return false; }
+  await refreshModel(); return true;
+}
+function resetBtn(file, key, origin) {
+  if (!(origin === "arma" || origin === "clase")) return null;
+  return el("button", {class: "small ghost", title: "Quita el cambio y vuelve al valor heredado",
+    onclick: () => save(file, scopeSection(), key, null).then(ok => ok && (renderTrig(), renderVoices()))}, "↺ heredado");
+}
+function renderTrig() {
+  const v = trigValues();
+  const label = SEL.wid ? (M.weapons.find(w => w.id === SEL.wid)?.name || SEL.wid) : CLASS_LABEL[SEL.cls];
+  $("#trigTitle").innerHTML = ""; $("#trigTitle").append(label, el("small", {}, SEL.wid ? `(${SEL.wid} · clase ${SEL.cls})` : "(clase)"));
+  $("#trigScope").textContent = `Los cambios se guardan en [${scopeSection()}] de unds_triggers.ini`;
+  const box = $("#trigCards"); box.innerHTML = "";
+  for (const c of TRIG_CARDS) {
+    const cur = v[c.key];
+    const ed = effectEditor({value: cur.value, onChange: t => save("triggers", scopeSection(), c.key, t)});
+    box.append(el("div", {class: "card"},
+      el("h3", {}, c.title, originBadge(cur.origin)), el("div", {class: "hint"}, c.hint), ed,
+      el("div", {class: "actions"},
+        el("button", {class: "small", onclick: () => api("/api/test", {kind: "trigger", side: c.side, text: ed.getText(), ms: 3000})}, `Sentir en ${c.side}2 · 3 s`),
+        resetBtn("triggers", c.key, cur.origin))));
+  }
+  const auto = v.automatica.value.toLowerCase();
+  const isAuto = auto === "si" || auto === "sí" || auto === "yes";
+  box.prepend(kickCard(isAuto ? "auto_kick" : "kick", v, isAuto));
+  const seg = el("div", {class: "seg", title: "Las automáticas golpean el gatillo en cada bala mientras mantienes R2; las demás, una vez por disparo."});
+  for (const [val, txt] of [["no", "Semiautomática"], ["si", "Automática"], ["auto", "Detectar"]]) {
+    seg.append(el("button", {class: auto === val || (val === "si" && isAuto) ? "sel" : "",
+      onclick: () => save("triggers", scopeSection(), "automatica", val).then(ok => ok && renderTrig())}, txt));
+  }
+  const tipo = $("#trigType"); tipo.innerHTML = "";
+  tipo.append(seg, resetBtn("triggers", "automatica", v.automatica.origin) || "");
+}
+function parseKick(text, defMs) {
+  return String(text).split(">").map(s => s.trim()).filter(Boolean).map(ch => {
+    const [e, ms] = ch.split("@"); return {effect: e.trim(), ms: ms ? +ms : defMs};
+  });
+}
+function kickCard(key, v, isAuto) {
+  const cur = v[key]; const defMs = +(v[key + "_ms"]?.value || 70);
+  let phases = parseKick(cur.value, defMs); let sel = 0;
+  const tl = el("div", {class: "timeline"}); const edBox = el("div"); const msRow = el("div");
+  const total = () => phases.reduce((a, p) => a + p.ms, 0);
+  const text = () => phases.map(p => `${p.effect} @${p.ms}`).join(" > ");
+  const emit = debounce(() => save("triggers", scopeSection(), key, text()), 300);
+  function draw() {
+    tl.innerHTML = ""; const span = Math.max(total(), isAuto ? +(M.triggerGlobals.auto_period_ms || 106) : 200);
+    phases.forEach((p, i) => {
+      const name = parseEffect(p.effect).name;
+      tl.append(el("div", {class: `phase ${name}` + (i === sel ? " sel" : ""), style: `flex:0 0 ${p.ms / span * 100}%`,
+        onclick: () => { sel = i; draw(); editPhase(); }}, el("b", {}, MODE_LABEL[name] || name), el("span", {}, `${p.ms} ms`)));
+    });
+    if (span > total()) tl.append(el("div", {class: "phase rest"}, el("span", {}, isAuto ? "hasta la siguiente bala" : "vuelve al tope")));
+  }
+  function editPhase() {
+    const p = phases[sel]; edBox.innerHTML = ""; msRow.innerHTML = "";
+    edBox.append(effectEditor({value: p.effect, onChange: t => { p.effect = t; draw(); emit(); }}));
+    const r = el("input", {type: "range", min: 5, max: 400, value: p.ms}); setP(r); const o = el("output", {}, p.ms);
+    r.addEventListener("input", () => { p.ms = +r.value; o.textContent = r.value; setP(r); draw(); emit(); });
+    msRow.append(el("div", {class: "row"}, el("label", {}, "duración ms"), r, o));
+  }
+  draw(); editPhase();
+  const voiceKey = isAuto ? "fire_auto" : "fire";
+  return el("div", {class: "card", style: "grid-column:1/-1"},
+    el("h3", {}, isAuto ? "Golpe por bala (ráfaga)" : "Retroceso al disparar", originBadge(cur.origin)),
+    el("div", {class: "hint"}, isAuto ? `Fases del gatillo en cada bala de la ráfaga; la cadencia es de ${M.triggerGlobals.auto_period_ms || 106} ms.`
+      : "Fases que el gatillo hace en cada disparo, una detrás de otra; luego vuelve al tope."),
+    tl, msRow, edBox,
+    el("div", {class: "actions"},
+      el("button", {class: "primary", onclick: () => api("/api/test", {kind: "kick", text: text(), voice: M.classVoices[SEL.cls][voiceKey].value})}, "Probar disparo"),
+      el("button", {class: "small", onclick: () => { phases.splice(sel + 1, 0, {effect: "VIBRATION 1 4 40", ms: 30}); sel++; draw(); editPhase(); emit(); }}, "+ fase"),
+      el("button", {class: "small", disabled: phases.length < 2 ? "" : null, onclick: () => { if (phases.length > 1) { phases.splice(sel, 1); sel = Math.max(0, sel - 1); draw(); editPhase(); emit(); } }}, "− fase"),
+      resetBtn("triggers", key, cur.origin)));
+}
+
+// ---------- pestaña Hápticos ----------
+let VOICE = {key: "fire", scope: "class"};
+const GLOBAL_VOICES = {hit: "Golpe lateral", hit_front: "Golpe de frente", hit_back: "Golpe por la espalda", death: "Muerte"};
+function voiceInfo() {
+  if (VOICE.scope === "class") {
+    const v = SEL.wid ? null : M.classVoices[SEL.cls][VOICE.key];
+    return {value: (v || M.classVoices[SEL.cls][VOICE.key]).value, origin: (v || M.classVoices[SEL.cls][VOICE.key]).origin,
+      file: "haptics", section: `clase ${SEL.cls}`};
+  }
+  return {value: M.hapticGlobals[VOICE.key], origin: "general", file: "haptics", section: "default"};
+}
+function parseVoice(text) {
+  if (!text || /^(OFF|NONE)$/i.test(text.trim())) return [];
+  return text.split("+").map(ch => { const w = ch.trim().split(/\s+/);
+    return {kind: w[0].toUpperCase(), hz: +w[1], ms: +w[2], gain: +w[3], pan: +w[4], decay: +w[5]}; });
+}
+const voiceText = L => L.length ? L.map(l => `${l.kind} ${+l.hz.toFixed(1)} ${Math.round(l.ms)} ${+l.gain.toFixed(2)} ${+l.pan.toFixed(2)} ${Math.round(l.decay)}`).join(" + ") : "OFF";
+async function drawWave(canvas, text) {
+  const ctx = canvas.getContext("2d"); const w = canvas.width = canvas.clientWidth * devicePixelRatio, h = canvas.height = canvas.clientHeight * devicePixelRatio;
+  ctx.clearRect(0, 0, w, h);
+  const d = await api("/api/voice?text=" + encodeURIComponent(text));
+  if (!d.ok) { ctx.fillStyle = "#e0574a"; ctx.font = `${12 * devicePixelRatio}px sans-serif`; ctx.fillText(d.error, 10, 20); return d; }
+  const mid = h / 2; ctx.strokeStyle = "#262a30"; ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+  const draw = (arr, sign, color) => { if (!arr.length) return; ctx.beginPath(); ctx.moveTo(0, mid);
+    arr.forEach((v, i) => ctx.lineTo(i / (arr.length - 1) * w, mid - sign * Math.min(1.4, v) / 1.4 * (mid - 6)));
+    ctx.lineTo(w, mid); ctx.closePath(); ctx.fillStyle = color; ctx.fill(); };
+  draw(d.l, 1, "rgba(231,195,106,.85)"); draw(d.r, -1, "rgba(79,195,180,.8)");
+  ctx.fillStyle = "#8f8a80"; ctx.font = `${11 * devicePixelRatio}px sans-serif`;
+  ctx.fillText("izquierdo", 8, 14 * devicePixelRatio); ctx.fillText("derecho", 8, h - 6 * devicePixelRatio);
+  ctx.textAlign = "right"; ctx.fillText(`${d.ms} ms · pico ${d.peak ?? 0}`, w - 8, 14 * devicePixelRatio);
+  if ((d.peak || 0) > 1.35) { ctx.fillStyle = "#e0574a"; ctx.fillText("¡pasa por el limitador!", w - 8, h - 6 * devicePixelRatio); }
+  return d;
+}
+function renderVoices() {
+  const pick = $("#voicePick"); pick.innerHTML = "";
+  const opts = [["fire", "class", `Disparo · ${CLASS_LABEL[SEL.cls]}`], ["fire_auto", "class", `Ráfaga · ${CLASS_LABEL[SEL.cls]}`],
+    ...Object.entries(GLOBAL_VOICES).map(([k, t]) => [k, "global", t])];
+  for (const [key, scope, label] of opts) pick.append(el("span", {class: "chip" + (VOICE.key === key ? " sel" : ""),
+    onclick: () => { VOICE = {key, scope}; renderVoices(); }}, label));
+  const info = voiceInfo(); let layers = parseVoice(info.value);
+  const card = $("#voiceCard"); card.innerHTML = "";
+  const canvas = el("canvas", {class: "wave"}); const list = el("div");
+  const codeIn = el("input", {type: "text", value: info.value});
+  const commit = debounce(() => save(info.file, info.section, VOICE.key, voiceText(layers)), 350);
+  const redraw = debounce(() => drawWave(canvas, voiceText(layers)), 90);
+  function renderLayers() {
+    list.innerHTML = "";
+    layers.forEach((L, i) => {
+      const seg = el("div", {class: "seg"});
+      for (const k of ["SINE", "NOISE"]) seg.append(el("button", {class: L.kind === k ? "sel" : "", onclick: () => { L.kind = k; renderLayers(); changed(); }}, k === "SINE" ? "Seno" : "Ruido"));
+      const rows = [["hz", L.kind === "SINE" ? "frecuencia Hz" : "corte Hz", 10, L.kind === "SINE" ? 300 : 2000, 1],
+        ["ms", "duración ms", 5, 1500, 1], ["gain", "ganancia", 0, 2, .01], ["pan", "izq ↔ der", -1, 1, .05], ["decay", "caída ms", 0, 2000, 1]];
+      const body = el("div");
+      for (const [k, lab, lo, hi, step] of rows) {
+        const r = el("input", {type: "range", min: lo, max: hi, step, value: L[k]}); setP(r); const o = el("output", {}, String(L[k]));
+        r.addEventListener("input", () => { L[k] = +r.value; o.textContent = r.value; setP(r); changed(); });
+        body.append(el("div", {class: "row"}, el("label", {}, lab), r, o));
+      }
+      list.append(el("div", {class: "layer"}, el("div", {class: "lh"}, el("b", {style: "font-size:12px;color:var(--muted)"}, `Capa ${i + 1}`), seg,
+        el("button", {class: "small ghost", style: "margin-left:auto", onclick: () => { layers.splice(i, 1); renderLayers(); changed(); }}, "quitar")), body));
+    });
+  }
+  function changed() { codeIn.value = voiceText(layers); redraw(); commit(); }
+  codeIn.addEventListener("change", () => { layers = parseVoice(codeIn.value); renderLayers(); redraw(); commit(); });
+  card.append(el("h3", {}, VOICE.scope === "class" ? `${VOICE.key === "fire" ? "Disparo" : "Ráfaga"} · ${CLASS_LABEL[SEL.cls]}` : GLOBAL_VOICES[VOICE.key], originBadge(info.origin)),
+    el("div", {class: "hint"}, VOICE.scope === "class" ? `Se guarda en [${info.section}] de unds_haptics.ini.` : "Voz común a todas las armas ([default] de unds_haptics.ini)."),
+    canvas, el("div", {class: "code", style: "margin-top:10px"}, el("span", {style: "color:var(--dim)"}, "ini"), codeIn), list,
+    el("div", {class: "actions"},
+      el("button", {class: "primary", onclick: () => api("/api/test", {kind: "voice", text: voiceText(layers)}).then(r => !r.ok && toast(r.error, true))}, "▶ Sentir"),
+      el("button", {class: "small", onclick: () => { layers.push({kind: "SINE", hz: 60, ms: 120, gain: .6, pan: 0, decay: 40}); renderLayers(); changed(); }}, "+ capa"),
+      VOICE.scope === "class" && info.origin === "clase" ? el("button", {class: "small ghost", onclick: () => save("haptics", info.section, VOICE.key, null).then(ok => ok && renderVoices())}, "↺ heredado") : null));
+  renderLayers(); requestAnimationFrame(() => drawWave(canvas, info.value));
+}
+
+// parámetros numéricos genéricos
+function paramRows(box, file, section, defs, values) {
+  box.innerHTML = "";
+  for (const [key, label, lo, hi, step] of defs) {
+    const cur = values[key];
+    if (lo === "bool") {
+      const seg = el("div", {class: "seg"});
+      for (const [v, t] of [["on", "sí"], ["off", "no"]]) seg.append(el("button", {class: String(cur).toLowerCase() === v ? "sel" : "",
+        onclick: () => save(file, section, key, v).then(() => paramRows(box, file, section, defs, curValues(file)))}, t));
+      box.append(el("div", {class: "row"}, el("label", {}, label), seg, el("span")));
+      continue;
+    }
+    const r = el("input", {type: "range", min: lo, max: hi, step, value: parseFloat(cur)}); setP(r);
+    const o = el("output", {}, String(cur));
+    const commit = debounce(() => save(file, section, key, r.value), 350);
+    r.addEventListener("input", () => { o.textContent = r.value; setP(r); commit(); });
+    box.append(el("div", {class: "row", title: key}, el("label", {}, label), r, o));
+  }
+}
+const curValues = file => file === "haptics" ? M.hapticGlobals : M.triggerGlobals;
+
+// ---------- Daño y muerte ----------
+function buildCompass() {
+  const NS = "http://www.w3.org/2000/svg"; const svg = document.createElementNS(NS, "svg"); svg.setAttribute("viewBox", "-140 -140 280 280");
+  const add = (tag, a) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); svg.append(e); return e; };
+  add("circle", {r: 128, fill: "#0e1013", stroke: "#262a30"}); add("circle", {r: 92, fill: "none", stroke: "#1f2328", "stroke-dasharray": "3 5"});
+  for (let a = 0; a < 360; a += 15) { const r1 = a % 90 ? 120 : 112, t = a * Math.PI / 180;
+    add("line", {x1: Math.sin(t) * r1, y1: -Math.cos(t) * r1, x2: Math.sin(t) * 128, y2: -Math.cos(t) * 128, stroke: a % 90 ? "#2b3037" : "#8a7440"}); }
+  [["DELANTE", 0, -100], ["DETRÁS", 0, 108], ["IZQ", -102, 4], ["DER", 102, 4]].forEach(([t, x, y]) => {
+    const tx = add("text", {x, y, fill: "#5f5b55", "font-size": 10, "text-anchor": "middle", "letter-spacing": "2"}); tx.textContent = t; });
+  // figura vista desde arriba (hombros y cabeza), mirando hacia arriba
+  add("ellipse", {cx: 0, cy: 6, rx: 34, ry: 15, fill: "#2a2e34", stroke: "#3a4048"});
+  add("circle", {cx: 0, cy: 2, r: 12, fill: "#3a3f47", stroke: "#4a5059"});
+  add("path", {d: "M-6 -16 L0 -26 L6 -16 Z", fill: "#8a7440"});
+  const ray = add("line", {x1: 0, y1: 0, x2: 0, y2: 0, stroke: "#e0574a", "stroke-width": 3, "stroke-linecap": "round", opacity: 0});
+  const dot = add("circle", {r: 7, fill: "#e0574a", opacity: 0});
+  svg.addEventListener("click", async ev => {
+    const b = svg.getBoundingClientRect(); const x = (ev.clientX - b.left) / b.width * 280 - 140, y = (ev.clientY - b.top) / b.height * 280 - 140;
+    const az = (Math.atan2(x, -y) * 180 / Math.PI + 360) % 360; const t = az * Math.PI / 180;
+    ray.setAttribute("x1", Math.sin(t) * 120); ray.setAttribute("y1", -Math.cos(t) * 120); ray.setAttribute("x2", Math.sin(t) * 40); ray.setAttribute("y2", -Math.cos(t) * 40);
+    dot.setAttribute("cx", Math.sin(t) * 120); dot.setAttribute("cy", -Math.cos(t) * 120);
+    for (const e of [ray, dot]) { e.setAttribute("opacity", 1); e.animate([{opacity: 1}, {opacity: .15}], {duration: 900, fill: "forwards"}); }
+    const signed = az > 180 ? az - 360 : az;
+    const r = await api("/api/test", {kind: "hit", az: signed, amt: +$("#hitAmt").value});
+    if (!r.ok) return toast(r.error, true);
+    let l = 0, rr = 0; (r.mix || []).forEach(m => { l += m.l; rr += m.r; });
+    $("#mixL").style.width = Math.min(100, l * 100) + "%"; $("#mixR").style.width = Math.min(100, rr * 100) + "%";
+    $("#mixLo").textContent = l.toFixed(2); $("#mixRo").textContent = rr.toFixed(2);
+    $("#mixNames").textContent = `${Math.round(signed)}° → ` + (r.mix || []).map(m => GLOBAL_VOICES[m.name] || m.name).join(" + ");
+  });
+  $("#compass").append(svg);
+}
+
+// ---------- Lightbar ----------
+const rgbOf = s => String(s).split(/[\s,]+/).map(Number);
+const hex = ([r, g, b]) => "#" + [r, g, b].map(v => Math.max(0, Math.min(255, v | 0)).toString(16).padStart(2, "0")).join("");
+const unhex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const scale = ([r, g, b], k) => { const m = Math.max(r, g, b) || 1; const kk = Math.min(k, 255 / m); return [r, g, b].map(v => Math.round(v * kk)); };
+function renderLed() {
+  paramRows($("#ledParams"), "triggers", "default", [["led_gain", "ganancia", 1, 8, .1], ["led_brightness", "brillo", 0, 255, 1]], M.triggerGlobals);
+  const g = +M.triggerGlobals.led_gain || 4; const box = $("#swatches"); box.innerHTML = "";
+  const items = [
+    ["Vida llena (juego)", scale([32, 32, 0], g), null], ["Vida crítica (juego)", scale([64, 0, 0], g), null],
+    ["Golpe recibido", rgbOf(M.triggerGlobals.damage_rgb), "damage_rgb"], ["Muerte", scale(rgbOf(M.triggerGlobals.death_rgb), g), "death_rgb"],
+    ["Menú / pausa", rgbOf(M.triggerGlobals.menu_rgb), "menu_rgb"]];
+  for (const [label, rgb, key] of items) {
+    const c = el("div", {class: "c", style: `background:${hex(rgb)}`});
+    const b = el("div", {class: "b"}, el("div", {}, label), el("div", {class: "note", style: "font-family:var(--mono)"}, rgb.join(",")));
+    if (key === "death_rgb") b.append(el("div", {class: "note"}, `color base ${M.triggerGlobals.death_rgb} × ganancia`));
+    if (key) { const pickIn = el("input", {type: "color", value: hex(key === "death_rgb" ? rgbOf(M.triggerGlobals[key]) : rgb)});
+      pickIn.addEventListener("change", () => save("triggers", "default", key, unhex(pickIn.value).join(",")).then(ok => ok && renderLed())); b.append(pickIn); }
+    b.append(el("button", {class: "small", style: "margin-top:6px", onclick: () => api("/api/test", {kind: "rgb", rgb, ms: 2500})}, "Ver en el mando"));
+    box.append(el("div", {class: "sw"}, c, b));
+  }
+}
+
+// ---------- Avanzado ----------
+function renderAdv() {
+  const body = $("#advBody"); body.innerHTML = ""; const q = $("#advFilter").value.trim().toLowerCase();
+  for (const [file, label] of [["triggers", "unds_triggers.ini"], ["haptics", "unds_haptics.ini"]]) {
+    body.append(el("h4", {}, label));
+    for (const sec of M.ini[file]) {
+      const rows = sec.keys.filter(k => !q || (k.key + " " + k.value + " " + k.doc + " " + sec.name).toLowerCase().includes(q));
+      if (!rows.length) continue;
+      const t = el("table", {}, el("colgroup", {}, el("col", {class: "k"}), el("col", {class: "v"}), el("col")));
+      t.append(el("tr", {}, el("td", {colspan: 3, style: "color:var(--muted);font-size:12px;padding-top:12px"}, `[${sec.name}]`)));
+      for (const k of rows) {
+        const inp = el("input", {type: "text", value: k.value});
+        const commit = async () => { if (inp.value === k.value) return; if (await save(file, sec.name, k.key, inp.value)) { k.value = inp.value; toast(`[${sec.name}] ${k.key} guardado`); } else inp.value = k.value; };
+        inp.addEventListener("keydown", e => e.key === "Enter" && inp.blur()); inp.addEventListener("blur", commit);
+        t.append(el("tr", {}, el("td", {class: "k", title: k.key, style: "overflow:hidden;text-overflow:ellipsis"}, k.key), el("td", {}, inp), el("td", {class: "d"}, k.doc)));
+      }
+      body.append(t);
+    }
+  }
+}
+
+// ---------- galería: armas ----------
+function renderChips() {
+  const box = $("#weaponChips"); box.innerHTML = "";
+  for (const cls of M.classes) box.append(el("span", {class: "chip" + (!SEL.wid && SEL.cls === cls ? " sel" : ""), onclick: () => pick(cls, "")}, icon(cls), CLASS_LABEL[cls] || cls));
+  if (M.weapons.length) {
+    box.append(el("div", {class: "note", style: "flex-basis:100%;margin-top:6px;letter-spacing:.12em;text-transform:uppercase;font-size:10.5px"}, "Tus armas de U1 (por id)"));
+    for (const w of M.weapons) box.append(el("span", {class: "chip" + (SEL.wid === w.id ? " sel" : ""), title: w.id, onclick: () => pick(w.cls, w.id)}, icon(w.cls), w.name.split("(")[0].trim() || w.id, el("small", {}, w.id.slice(-4))));
+  }
+}
+async function pick(cls, wid) {
+  SEL = {cls, wid}; await api("/api/range", {cls, wid}); renderChips(); renderTrig(); renderVoices();
+}
+
+// ---------- refresco ----------
+async function refreshModel() {
+  M = await api("/api/model");
+  $("#files").textContent = "";
+}
+let lastShots = 0, lastEvents = "";
+function paintLive(d) {
+  LIVE = d;
+  const pad = d.pad, hap = d.haptics;
+  $("#pPad").className = "pill " + (pad.ok ? "on" : "warn"); $("#pPad span").textContent = pad.demo ? "Mando (demo)" : pad.ok ? "Mando USB" : "Mando";
+  $("#pHap").className = "pill " + (hap.ok ? "on" : "warn"); $("#pHap span").textContent = hap.ok ? "Hápticos" : "Hápticos (no)";
+  $("#pHap").title = hap.ok ? hap.device : hap.why;
+  $("#pGame").className = "pill " + (d.game ? "warn" : "on"); $("#pGame span").textContent = d.game ? "Juego abierto" : "Juego cerrado";
+  $("#padwhy").textContent = pad.why || "";
+  const ban = $("#banner");
+  if (d.game) { ban.className = "banner on"; ban.textContent = "El juego está abierto: él es dueño del mando, así que aquí no se puede probar en los gatillos. Lo que cambies se guarda y el companion lo aplica al momento en el juego."; }
+  else if (!pad.ok) { ban.className = "banner on"; ban.textContent = "Mando: " + (pad.why || "sin conexión") + ". Puedes seguir editando; las pruebas en los gatillos vuelven al conectarlo por USB."; }
+  else ban.className = "banner";
+  const sent = d.sent || {};
+  paintRail("#railL", sent.L || "OFF", pad.l2, M.thresholds.l2); paintRail("#railR", sent.R || "OFF", pad.r2, M.thresholds.r2);
+  $("#valL").textContent = pad.l2; $("#valR").textContent = pad.r2;
+  $("#effL").textContent = sent.L || "—"; $("#effR").textContent = sent.R || "—";
+  if (sent.RGB) document.documentElement.style.setProperty("--led", `rgb(${sent.RGB.join(",")})`);
+  const R = d.range; $("#rangeOn").checked = R.on;
+  $("#ammoCount").textContent = R.clip ? `${R.ammo}/${R.clip}` : "∞";
+  const mag = $("#mag"); const n = R.clip || 0;
+  if (mag.childElementCount !== n) { mag.innerHTML = ""; for (let i = 0; i < n; i++) mag.append(el("i")); }
+  [...mag.children].forEach((b, i) => b.className = i < R.ammo ? "" : "out");
+  $("#tAim").classList.toggle("on", R.aiming); $("#tFire").classList.toggle("on", R.firing);
+  $("#tAuto").classList.toggle("on", R.auto); $("#tReload").classList.toggle("on", R.reloading);
+  $("#tEmpty").classList.toggle("on", R.clip > 0 && R.ammo === 0 && !R.reloading);
+  if (R.shots !== lastShots) { const f = $("#flash"); f.classList.add("on"); setTimeout(() => f.classList.remove("on"), 60); lastShots = R.shots; }
+  const evs = JSON.stringify(d.events);
+  if (evs !== lastEvents) { lastEvents = evs; const log = $("#log"); log.innerHTML = "";
+    d.events.slice().reverse().forEach(e => log.append(el("div", {}, new Date(e.t * 1000).toLocaleTimeString() + "  " + e.text))); }
+}
+async function poll() {
+  try { paintLive(await api("/api/live")); } catch (e) { $("#pPad").className = "pill warn"; $("#padwhy").textContent = "sin conexión con el Studio"; }
+  setTimeout(poll, 60);
+}
+
+// ---------- arranque ----------
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("sel", x === t));
+  document.querySelectorAll(".view").forEach(v => v.classList.toggle("sel", v.id === t.dataset.v));
+  if (t.dataset.v === "vAdv") renderAdv(); if (t.dataset.v === "vLed") renderLed(); if (t.dataset.v === "vHap") renderVoices();
+}));
+$("#advFilter").addEventListener("input", debounce(renderAdv, 150));
+$("#rangeOn").addEventListener("change", e => api("/api/range", {on: e.target.checked}));
+$("#bReload").addEventListener("click", () => api("/api/range", {reload: true}));
+$("#bRelease").addEventListener("click", () => api("/api/test", {kind: "release"}).then(() => toast("Mando libre")));
+$("#bRestore").addEventListener("click", async () => {
+  if (!confirm("¿Volver los dos .ini a como estaban al abrir el Studio?")) return;
+  await api("/api/restore"); await refreshModel(); renderAll(); toast("Ajustes restaurados");
+});
+$("#hitAmt").addEventListener("input", e => { $("#hitAmtO").textContent = e.target.value; setP(e.target); });
+$("#bDeath").addEventListener("click", () => api("/api/test", {kind: "death"}).then(r => !r.ok && toast(r.error, true)));
+$("#bDeathEdit").addEventListener("click", () => { VOICE = {key: "death", scope: "global"}; document.querySelector('.tab[data-v="vHap"]').click(); });
+document.querySelectorAll("#vHap input[type=range]").forEach(r => { setP(r); r.addEventListener("input", () => { setP(r); knobs(); }); });
+function knobs() { for (const [k, id] of [["L", "#mL"], ["S", "#mS"]]) { const v = +$(id).value; const kn = $("#knob" + k); kn.innerHTML = `<span>${v}</span>`; kn.style.setProperty("--a", (v / 255 * 360) + "deg"); } }
+document.querySelectorAll(".hold").forEach(b => {
+  let timer = null;
+  const start = e => { e.preventDefault(); b.classList.add("active"); const tick = () => api("/api/test", {kind: "rumble", l: b.dataset.m === "L" ? +$("#mL").value : 0, s: b.dataset.m === "S" ? +$("#mS").value : 0}); tick(); timer = setInterval(tick, 400); };
+  const stop = () => { if (!timer) return; clearInterval(timer); timer = null; b.classList.remove("active"); api("/api/test", {kind: "rumble", l: 0, s: 0}); };
+  b.addEventListener("pointerdown", start); b.addEventListener("pointerup", stop); b.addEventListener("pointerleave", stop);
+});
+function renderAll() {
+  renderChips(); renderTrig(); renderVoices(); renderLed(); knobs();
+  paramRows($("#rumbleParams"), "haptics", "default", [["rumble_l_gain", "fuerza grande", 0, 2, .05], ["rumble_s_gain", "fuerza pequeño", 0, 2, .05],
+    ["rumble_curve", "curva", .2, 2, .05], ["rumble_l_pan", "pan grande", -1, 1, .05], ["rumble_s_pan", "pan pequeño", -1, 1, .05]], M.hapticGlobals);
+  paramRows($("#hitParams"), "haptics", "default", [["hit_pan", "separación lados", 0, 1, .05], ["hit_pan_curve", "curva del lado", .1, 3, .05],
+    ["hit_gain_min", "fuerza mínima", 0, 1, .05], ["hit_full_amt", "daño a tope", 1, 300, 1], ["hit_timbre", "timbre delante/detrás", "bool"],
+    ["hit_timbre_curve", "curva del timbre", .1, 4, .05], ["hit_duck", "rumble durante golpe", 0, 1, .05]], M.hapticGlobals);
+  paramRows($("#deathParams"), "haptics", "default", [["death_stop_ms", "corte al reaparecer", 0, 2000, 10], ["death_duck", "rumble al morir", 0, 1, .05]], M.hapticGlobals);
+}
+(async () => {
+  buildRail("#railL"); buildRail("#railR"); buildCompass();
+  await refreshModel();
+  const live = await api("/api/live"); SEL = {cls: live.range.cls, wid: live.range.wid};
+  renderAll(); poll();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Para empaquetar UNDS.exe (scripts/unds_release.sh). Python 3.12 de python.org.
+pyinstaller>=6.10
+numpy>=1.24
+sounddevice>=0.5
+hidapi>=0.14

@@ -1,0 +1,67 @@
+From 96ba49519a45351f0d70c18cee13ca0730bde959 Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 7/8] run.py: mesh raycaster copies on by default in Uncharted
+ 1 too
+
+Uncharted 1 stops with the same assertion the fix exists for, right after
+a checkpoint save:
+
+  ASSERTION: iSubMesh < m_numSubMeshInstances
+  (GetSubMeshInstance, ndlib/render/ngen/mesh.h:1361)
+
+seen twice on 0.3.8/0.3.9 (once on a clean red-zone boot) with the fix on
+Automatic, which run.py resolves to off outside Uncharted 2. With the
+Fixes page set to On (BB_SCALAR_COPY64_SYNC=2, DEFER=1) U1 has been
+played since across several sessions and checkpoint saves without it.
+
+Automatic now means on in Uncharted 1 and 2 (still off in Uncharted 3,
+where it cost 94 to 54 FPS in Cartagena). An explicit On/Off from the
+launcher or the environment wins, as before. The frame-rate cost in U1
+was not measured; nothing noticeable while playing on an RTX 3060 Laptop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JjXy3Jjs4Eb5CW4ouhg3nL
+---
+ launcher/uncharted_launcher.py | 4 ++--
+ run.py                         | 8 +++++---
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/launcher/uncharted_launcher.py b/launcher/uncharted_launcher.py
+index 769000c..6036636 100644
+--- a/launcher/uncharted_launcher.py
++++ b/launcher/uncharted_launcher.py
+@@ -161,8 +161,8 @@ FIXES = {
+         'Automatic: on in Uncharted 2 only. Costs speed in busy scenes.',
+         {'on': {'BB_GPU_MERGE': '0'}, 'off': {'BB_GPU_MERGE': '1'}}),
+     'fix_u2_mesh': (
+-        'Mesh raycaster copies (Uncharted 2)',
+-        'Fixes "iSubMesh < m_numSubMeshInstances" after checkpoints. Automatic: on in Uncharted 2 only. '
++        'Mesh raycaster copies (Uncharted 1 and 2)',
++        'Fixes "iSubMesh < m_numSubMeshInstances" after checkpoints. Automatic: on in Uncharted 1 and 2. '
+         'In Uncharted 3\'s Cartagena square it cost 94 to 54 FPS.',
+         {'on': {'BB_SCALAR_COPY64_SYNC': '2', 'BB_SCALAR_COPY64_DEFER': '1'},
+          'off': {'BB_SCALAR_COPY64_SYNC': '0', 'BB_SCALAR_COPY64_DEFER': '0'}}),
+diff --git a/run.py b/run.py
+index 70d02a9..a9211d3 100644
+--- a/run.py
++++ b/run.py
+@@ -217,10 +217,12 @@ def main():
+                 env.pop('BB_GPU_MERGE', None)
+         if player_tiny is None:
+             env['BB_TINY_READBACK'] = '1' if exe == EXECUTABLES['u2'] else '0'
+-        # Its mesh raycaster copies land in guest memory too (iSubMesh after checkpoints).
++        # Its mesh raycaster copies land in guest memory too (iSubMesh after checkpoints); Uncharted 1
++        # hits the same assertion after checkpoints, so both get the copies unless the player chose.
+         if player_copy is None:
+-            env['BB_SCALAR_COPY64_SYNC'] = '2' if exe == EXECUTABLES['u2'] else '0'
+-            env['BB_SCALAR_COPY64_DEFER'] = '1' if exe == EXECUTABLES['u2'] else '0'
++            mesh = exe in (EXECUTABLES['u1'], EXECUTABLES['u2'])
++            env['BB_SCALAR_COPY64_SYNC'] = '2' if mesh else '0'
++            env['BB_SCALAR_COPY64_DEFER'] = '1' if mesh else '0'
+         game, file = locate(env, exe)
+         if not game:
+             fail('Set BB_GAME_DIR to the game folder (the one with eboot.bin).')
+-- 
+2.34.1
+

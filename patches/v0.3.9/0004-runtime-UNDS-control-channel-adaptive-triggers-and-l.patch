@@ -1,0 +1,842 @@
+From 883bbc62b60a6e230fef0ec192a3ef49214af297 Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 4/8] runtime: UNDS control channel: adaptive triggers and
+ light bar through SDL
+
+The companion no longer writes the DualSense itself (hidapi, USB only, a
+second writer of the output report next to SDL). It answers to the
+address the UNDS events come from with 37-byte binary datagrams and the
+runtime hands them to SDL_SendGamepadEffect, so SDL's HIDAPI PS5 driver
+stays the only writer, over USB and Bluetooth alike:
+
+  0 "UNDC"  4 version 1  5 flags (1 R2, 2 L2, 4 light bar, 8 release)
+  8 seq (u32 LE)  12 R2 effect (11 bytes)  23 L2 effect  34 r g b
+
+- On with UNDS_EVENTS unless UNDS_FX=0. The event socket is bound before
+  its first send (to 127.0.0.1 for a loopback companion) and only takes
+  datagrams from the UNDS_EVENTS host; SIO_UDP_CONNRESET is turned off on
+  Windows so a hello sent while nobody listens does not break recvfrom.
+- The event socket is overlapped on Windows (what socket() gives): a
+  synchronous WSASocketW handle serializes every operation, and each
+  sendto from the game's and the audio threads waited for the fx
+  receiver's select (6.27 s for three pad events in unds-test; 160 us
+  after the change).
+- A receiver thread (select, 100 ms) writes each command at once; SDL
+  queues it for its rumble thread (no wait in the game's threads). Only
+  the trigger and light bar enable bits are ever set, never rumble
+  emulation (which turns the audio haptics off); trigger modes outside
+  the controller's known set are rejected.
+- While the companion holds the light bar, scePadSetLightBar is still
+  published but not shown; on release (command, 5 s without datagrams,
+  or bye) both triggers go off and the game's colour comes back. At bye
+  the release gets 30 ms to reach the controller before the process
+  exits. After a controller reconnects the held state is written again.
+- Every command gets an "fx" event (ok, time to SDL); hello gains fx,
+  fxp, fxc, fxr, fxe, fxo; the exit report gains an fx line.
+- runtime_pad.c: runtime_pad_unds_effect (DualSense only: other pads are
+  logged once and ignored), runtime_pad_unds_generation and
+  runtime_pad_unds_game_led.
+- unds-test covers the channel against a stand-in of runtime_pad.c:
+  report layout, rejections, keep-alive, reconnect, release, watchdog,
+  bye. It accepts datagrams reordered between sender threads (each seq
+  must still arrive exactly once), measures the pad rate-limit calls
+  instead of assuming they fit in 8 ms, uses a 4 KiB receive buffer
+  (Windows refuses longer datagrams), prints the last datagram on a
+  failed assertion and fails if a sendto takes 250 ms or more.
+  UNDS_VERSION 0.5.0, protocol stays 1 (fields and one event added).
+
+Tested on Windows 11 (unds-test; in game hundreds of commands, 0
+rejected, 0 SDL failures, triggers released on the companion's Ctrl+C,
+Alt+F4 and the window's X) and under Wine.
+
+Without UNDS_EVENTS nothing changes and nothing is printed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JjXy3Jjs4Eb5CW4ouhg3nL
+---
+ src/runtime_pad.c  |  45 +++++++-
+ src/runtime_unds.c | 248 ++++++++++++++++++++++++++++++++++++++++++++-
+ src/runtime_unds.h |  46 ++++++++-
+ tests/test_unds.c  | 227 ++++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 547 insertions(+), 19 deletions(-)
+
+diff --git a/src/runtime_pad.c b/src/runtime_pad.c
+index 04b6113..b0200ca 100644
+--- a/src/runtime_pad.c
++++ b/src/runtime_pad.c
+@@ -1175,7 +1175,8 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
+ }
+ /* Light bar {r, g, b}: shown on controllers that have one (DualShock 4, DualSense). */
+ static void set_led(uint8_t r, uint8_t g, uint8_t b) {
+-    if (runtime_unds_led_enabled()) {
++    /* UNDS: not while the companion holds the light bar (control channel); it gets the colour from the "led" event */
++    if (runtime_unds_led_enabled() && !runtime_unds_fx_led_owned()) {
+         pthread_mutex_lock(&lock);
+         SDL_Gamepad *pad=current_gamepad();
+         if (pad) SDL_SetGamepadLED(pad,r,g,b);
+@@ -1194,6 +1195,48 @@ static ABI int32_t pad_reset_light_bar(int32_t handle) {
+     set_led(0,0,255); /* user 1 colour */
+     return 0;
+ }
++/* UNDS control channel (runtime_unds.h): the companion's trigger effects and light bar, written by
++ * SDL (HIDAPI PS5 driver: the bytes go verbatim after the report id; USB and Bluetooth). Called
++ * from runtime_unds.c's receiver thread; SDL_SendGamepadEffect is thread-safe and only queues the
++ * report, so `lock` is held for microseconds. */
++int runtime_pad_unds_effect(const uint8_t *effects, int size) {
++    static int warned_type, warned_sdl; /* under lock */
++    int result=1;
++    pthread_mutex_lock(&lock);
++    SDL_Gamepad *pad=opened ? current_gamepad() : NULL;
++    if (!pad) result=0;
++    else if (SDL_GetGamepadType(pad)!=SDL_GAMEPAD_TYPE_PS5) {
++        result=-1;
++        if (!warned_type) {
++            warned_type=1;
++            const char *name=SDL_GetGamepadName(pad);
++            printf("Runtime: UNDS: fx: %s is not a DualSense: the companion's triggers and light bar are ignored\n",
++                   name ? name : "the controller");
++        }
++    } else if (!SDL_SendGamepadEffect(pad,effects,size)) {
++        result=-2;
++        if (!warned_sdl) {
++            warned_sdl=1;
++            printf("Runtime: UNDS: fx: SDL_SendGamepadEffect failed (%s); further failures are only counted\n",SDL_GetError());
++        }
++    }
++    pthread_mutex_unlock(&lock);
++    return result;
++}
++unsigned runtime_pad_unds_generation(void) {
++    pthread_mutex_lock(&lock);
++    const unsigned generation=connected_count;
++    pthread_mutex_unlock(&lock);
++    return generation;
++}
++void runtime_pad_unds_game_led(uint8_t r, uint8_t g, uint8_t b) {
++    if (!runtime_unds_led_enabled()) return;
++    pthread_mutex_lock(&lock);
++    SDL_Gamepad *pad=opened ? current_gamepad() : NULL;
++    if (pad) SDL_SetGamepadLED(pad,r,g,b);
++    pthread_mutex_unlock(&lock);
++}
++
+ static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
+ static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
+ 
+diff --git a/src/runtime_unds.c b/src/runtime_unds.c
+index 423fc90..8fd4e9e 100644
+--- a/src/runtime_unds.c
++++ b/src/runtime_unds.c
+@@ -23,7 +23,12 @@
+  *          rumble(1 SDL rumble on) led(1 SDL light bar on) trig("l2,r2" press thresholds)
+  *          sent drop err smax(longest sendto since last hello, us)
+  *          vib(scePadSetVibration calls) ports("id:type:channels:frames,...")
++ *          fx(1 control channel open) fxp(its UDP port) fxc fxr fxe (commands taken, datagrams
++ *          rejected, SDL failures) fxo(UNDS_FX_* bits the companion holds now)
+  *   bye    reason
++ *   fx     the control channel did something: c (command seq, 0 if not a command) f (its flags)
++ *          ok (1 written, 0 no controller yet, -1 not a DualSense, -2 SDL refused) q (us from
++ *          the datagram to SDL's return) why (cmd, release, reconnect, timeout)
+  *   rumble l s (0-255) re(1 refresh)
+  *   led    r g b re(1 refresh)
+  *   pad    b(button mask, BTN_* of runtime_pad.c) lx ly rx ry l2 r2 (0-255, what the game read;
+@@ -48,6 +53,9 @@
+ #ifdef _WIN32
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
++#ifndef SIO_UDP_CONNRESET /* mstcpip.h; not every SDK exposes it without that header */
++#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR,12)
++#endif
+ #endif
+ #include "runtime.h"
+ #include "runtime_unds.h"
+@@ -120,6 +128,20 @@ static AudioAcc audio_acc[UNDS_PORTS];
+ static void game_state_refresh(uint64_t now);
+ static void game_state_counters(char *out, size_t size);
+ 
++/* Control channel (fx). */
++#define FX_POLL_MS 100
++#define FX_BYE_FLUSH_NS 30000000u /* SDL writes effects from its rumble thread, 10 ms apart */
++static _Atomic uint64_t fx_timeout_us=5000000u; /* a variable for the test */
++static _Atomic int fx_on, fx_led, fx_held, fx_port, fx_reject_logged;
++static _Atomic uint64_t fx_commands, fx_rejected, fx_failures, fx_reapplied, fx_timeouts;
++static pthread_mutex_t fx_lock=PTHREAD_MUTEX_INITIALIZER;
++/* under fx_lock: fx_held (atomic for the hello) is only written here */
++static int fx_closed;
++static uint8_t fx_right[11], fx_left[11], fx_rgb[3];
++static uint64_t fx_last_us;
++static unsigned fx_generation;
++static void fx_shutdown(void);
++
+ static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
+ static uint64_t now_us(void) { return now_ns()/1000u; }
+ static void sleep_ns(uint64_t ns) {
+@@ -209,7 +231,7 @@ __attribute__((format(printf,2,3)))
+ static void emit(const char *event, const char *fields, ...) {
+     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
+     if (atomic_load_explicit(&bye_done,memory_order_relaxed) && strcmp(event,"bye")) return;
+-    char text[512];
++    char text[1024]; /* hello is the longest: ~450 bytes with the audio ports and the counters */
+     const uint32_t n=atomic_fetch_add_explicit(&seq,1,memory_order_relaxed);
+     int head=snprintf(text,sizeof(text),"{\"v\":%d,\"seq\":%" PRIu32 ",\"t\":%" PRIu64 ",\"e\":\"%s\"",
+                       UNDS_PROTOCOL,n,now_us(),event);
+@@ -243,14 +265,18 @@ static void send_hello(int boot) {
+     const uint64_t smax=atomic_exchange_explicit(&send_max_ns,0,memory_order_relaxed);
+     emit("hello",",\"boot\":%d,\"exe\":\"%s\",\"bin\":\"%s\",\"pid\":%lu,\"base\":\"0x%" PRIxPTR "\",\"ver\":\"%s\","
+          "\"up\":%" PRIu64 ",\"rumble\":%d,\"led\":%d,\"trig\":\"%d,%d\",\"sent\":%" PRIu64 ",\"drop\":%" PRIu64 ",\"err\":%" PRIu64 ","
+-         "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\"%s",
++         "\"smax\":%" PRIu64 ",\"vib\":%" PRIu64 ",\"ports\":\"%s\","
++         "\"fx\":%d,\"fxp\":%d,\"fxc\":%" PRIu64 ",\"fxr\":%" PRIu64 ",\"fxe\":%" PRIu64 ",\"fxo\":%d%s",
+          boot,exe_id,exe_file,process_id,image_base,UNDS_VERSION,(now_us()-start_us)/1000u,
+          atomic_load_explicit(&rumble_on,memory_order_relaxed),atomic_load_explicit(&led_on,memory_order_relaxed),
+          atomic_load_explicit(&trigger_threshold[0],memory_order_relaxed),
+          atomic_load_explicit(&trigger_threshold[1],memory_order_relaxed),
+          atomic_load_explicit(&sent,memory_order_relaxed),atomic_load_explicit(&dropped,memory_order_relaxed),
+          atomic_load_explicit(&errors,memory_order_relaxed),smax/1000u,
+-         atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports,state);
++         atomic_load_explicit(&vibration_calls,memory_order_relaxed),ports,
++         atomic_load_explicit(&fx_on,memory_order_relaxed),atomic_load_explicit(&fx_port,memory_order_relaxed),
++         atomic_load_explicit(&fx_commands,memory_order_relaxed),atomic_load_explicit(&fx_rejected,memory_order_relaxed),
++         atomic_load_explicit(&fx_failures,memory_order_relaxed),atomic_load_explicit(&fx_held,memory_order_relaxed),state);
+ }
+ 
+ static void send_pad(const PadState *s) {
+@@ -325,8 +351,11 @@ static int open_socket(void) {
+     WSADATA data;
+     int error=WSAStartup(MAKEWORD(2,2),&data);
+     if (error) { printf("Runtime: UNDS: WSAStartup failed (%d); events off\n",error); return -1; }
++    /* WSA_FLAG_OVERLAPPED (what socket() gives): without it the handle is synchronous and Windows
++     * serializes every operation on it, so a sendto from the game's threads waited for the fx
++     * receiver's select() to time out, again and again (6 s for three pad events in unds-test). */
+ #ifdef WSA_FLAG_NO_HANDLE_INHERIT
+-    sock=WSASocketW(AF_INET,SOCK_DGRAM,IPPROTO_UDP,NULL,0,WSA_FLAG_NO_HANDLE_INHERIT);
++    sock=WSASocketW(AF_INET,SOCK_DGRAM,IPPROTO_UDP,NULL,0,WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+ #else
+     sock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+ #endif
+@@ -360,6 +389,196 @@ static int parse_thresholds(const char *text, int out[2]) {
+     return *text ? -1 : 0;
+ }
+ 
++/* ------------------------------------------------------------------------------------------
++ * Control channel (fx, see runtime_unds.h). One thread waits on the event socket (select, 100 ms)
++ * for the companion's datagrams and hands each one to SDL at once: SDL_SendGamepadEffect only
++ * queues the report for SDL's HIDAPI rumble thread, which writes it (and waits 10 ms before the
++ * next one; a newer report with the same enable bits replaces a queued one). The game's threads
++ * never wait on this: they only read fx_led. Lock order: fx_lock, then state_lock or the pad lock. */
++static const uint8_t fx_off[11]={0x05};
++
++/* The controller's trigger modes (Nielk1's TriggerEffectGenerator; dualsense-controller). */
++static int fx_mode_ok(uint8_t mode) {
++    switch (mode) {
++    case 0x01: case 0x02: case 0x05: case 0x06: case 0x11: case 0x12:
++    case 0x21: case 0x22: case 0x23: case 0x25: case 0x26: case 0x27: return 1;
++    default: return 0;
++    }
++}
++/* One report with the parts in `flags` (fx_lock held). Only the trigger and light bar enable bits
++ * are set: rumble emulation (bit 0x01 / 0x02 of the first byte) would turn the audio haptics off. */
++static int fx_write(int flags, const uint8_t *right, const uint8_t *left, const uint8_t *rgb) {
++    uint8_t e[UNDS_DS5_EFFECTS_SIZE];
++    memset(e,0,sizeof(e));
++    if (flags&UNDS_FX_RIGHT) { e[UNDS_DS5_ENABLE1]|=0x04; memcpy(e+UNDS_DS5_RIGHT,right,11); }
++    if (flags&UNDS_FX_LEFT) { e[UNDS_DS5_ENABLE1]|=0x08; memcpy(e+UNDS_DS5_LEFT,left,11); }
++    if (flags&UNDS_FX_LED) { e[UNDS_DS5_ENABLE2]|=0x04; memcpy(e+UNDS_DS5_RGB,rgb,3); }
++    if (!e[UNDS_DS5_ENABLE1] && !e[UNDS_DS5_ENABLE2]) return 1;
++    const int result=runtime_pad_unds_effect(e,(int)sizeof(e));
++    if (result<0) atomic_fetch_add_explicit(&fx_failures,1,memory_order_relaxed);
++    return result;
++}
++/* Both triggers off; the light bar back to the game's colour if the companion held it and SDL
++ * may show the game's light bar (UNDS_LED is not 0). fx_lock held. */
++static int fx_release_locked(void) {
++    uint8_t rgb[3]={0,0,0};
++    int give_back=0;
++    if ((atomic_load_explicit(&fx_held,memory_order_relaxed)&UNDS_FX_LED) && atomic_load_explicit(&led_on,memory_order_relaxed)) {
++        pthread_mutex_lock(&state_lock);
++        if (led_valid) { memcpy(rgb,led_rgb,3); give_back=1; }
++        pthread_mutex_unlock(&state_lock);
++    }
++    atomic_store_explicit(&fx_held,0,memory_order_relaxed);
++    atomic_store_explicit(&fx_led,0,memory_order_relaxed);
++    const int result=fx_write(UNDS_FX_RIGHT|UNDS_FX_LEFT|(give_back ? UNDS_FX_LED : 0),fx_off,fx_off,rgb);
++    /* and through SDL's own call, so its cached colour is the game's again */
++    if (give_back) runtime_pad_unds_game_led(rgb[0],rgb[1],rgb[2]);
++    return result;
++}
++static void fx_event(uint32_t command, int flags, int result, uint64_t since_ns, const char *why) {
++    emit("fx",",\"c\":%" PRIu32 ",\"f\":%d,\"ok\":%d,\"q\":%" PRIu64 ",\"why\":\"%s\"",command,flags,result,
++         (now_ns()-since_ns)/1000u,why);
++}
++static void fx_reject(const char *why, const struct sockaddr_in *from) {
++    atomic_fetch_add_explicit(&fx_rejected,1,memory_order_relaxed);
++    if (atomic_exchange_explicit(&fx_reject_logged,1,memory_order_relaxed)) return;
++    const uint32_t ip=from ? ntohl(from->sin_addr.s_addr) : 0;
++    printf("Runtime: UNDS: fx: datagram from %u.%u.%u.%u:%u rejected (%s); further ones are only counted\n",
++           ip>>24,(ip>>16)&255u,(ip>>8)&255u,ip&255u,from ? (unsigned)ntohs(from->sin_port) : 0u,why);
++}
++/* A valid datagram (size, magic, version and source already checked). */
++static void fx_command(const uint8_t *d, uint64_t received_ns, const struct sockaddr_in *from) {
++    const int flags=d[5];
++    const uint32_t command=(uint32_t)d[8] | (uint32_t)d[9]<<8 | (uint32_t)d[10]<<16 | (uint32_t)d[11]<<24;
++    const uint8_t *right=d+12, *left=d+23, *rgb=d+34;
++    if (!(flags&UNDS_FX_RELEASE) && (((flags&UNDS_FX_RIGHT) && !fx_mode_ok(right[0])) ||
++                                     ((flags&UNDS_FX_LEFT) && !fx_mode_ok(left[0])))) {
++        fx_reject("unknown trigger mode",from);
++        return;
++    }
++    atomic_fetch_add_explicit(&fx_commands,1,memory_order_relaxed);
++    int result;
++    const char *why="cmd";
++    pthread_mutex_lock(&fx_lock);
++    if (fx_closed) { pthread_mutex_unlock(&fx_lock); return; }
++    fx_last_us=now_us();
++    if (flags&UNDS_FX_RELEASE) {
++        result=fx_release_locked();
++        why="release";
++    } else {
++        const int parts=flags&(UNDS_FX_RIGHT|UNDS_FX_LEFT|UNDS_FX_LED);
++        if (parts&UNDS_FX_RIGHT) memcpy(fx_right,right,11);
++        if (parts&UNDS_FX_LEFT) memcpy(fx_left,left,11);
++        if (parts&UNDS_FX_LED) { memcpy(fx_rgb,rgb,3); atomic_store_explicit(&fx_led,1,memory_order_relaxed); }
++        atomic_fetch_or_explicit(&fx_held,parts,memory_order_relaxed);
++        result=fx_write(parts,right,left,rgb); /* flags 0: a keep-alive, nothing to write */
++    }
++    pthread_mutex_unlock(&fx_lock);
++    fx_event(command,flags,result,received_ns,why);
++}
++/* Every datagram waiting on the socket. */
++static void fx_receive(void) {
++    for (int i=0;i<64;++i) {
++        uint8_t d[64];
++        struct sockaddr_in from;
++        socklen_t length=sizeof(from);
++        memset(&from,0,sizeof(from));
++        const int n=(int)recvfrom(sock,(char *)d,(int)sizeof(d),0,(struct sockaddr *)&from,&length);
++        const uint64_t received=now_ns();
++        if (n<0) {
++            const int error=socket_error();
++            if (would_block(error)) return;
++#ifdef _WIN32
++            if (error==WSAECONNRESET) continue;           /* ICMP of an earlier send (SIO_UDP_CONNRESET is off anyway) */
++            if (error==WSAEMSGSIZE) { fx_reject("size",&from); continue; }
++#else
++            if (error==ECONNREFUSED) continue;
++#endif
++            atomic_fetch_add_explicit(&fx_rejected,1,memory_order_relaxed);
++            return;
++        }
++        if (from.sin_family!=AF_INET || from.sin_addr.s_addr!=destination.sin_addr.s_addr) { fx_reject("not the UNDS_EVENTS host",&from); continue; }
++        if (n!=UNDS_FX_SIZE || memcmp(d,"UNDC",4) || d[4]!=1) { fx_reject("not an UNDS fx v1 datagram",&from); continue; }
++        fx_command(d,received,&from);
++    }
++}
++/* 100 ms tick: the watchdog, and the held state again after the controller reconnects. */
++static void fx_tick(void) {
++    const unsigned generation=runtime_pad_unds_generation();
++    const uint64_t begin=now_ns(), now=begin/1000u;
++    const char *why=NULL; int result=0, flags=0;
++    pthread_mutex_lock(&fx_lock);
++    const int held=atomic_load_explicit(&fx_held,memory_order_relaxed);
++    if (!fx_closed && held) {
++        if (now-fx_last_us>fx_timeout_us) {
++            result=fx_release_locked(); why="timeout"; flags=UNDS_FX_RELEASE;
++            atomic_fetch_add_explicit(&fx_timeouts,1,memory_order_relaxed);
++        } else if (generation!=fx_generation) {
++            result=fx_write(held,fx_right,fx_left,fx_rgb); why="reconnect"; flags=held;
++            atomic_fetch_add_explicit(&fx_reapplied,1,memory_order_relaxed);
++        }
++    }
++    fx_generation=generation;
++    pthread_mutex_unlock(&fx_lock);
++    if (!why) return;
++    if (!strcmp(why,"timeout"))
++        printf("Runtime: UNDS: fx: no command for %" PRIu64 " ms (companion gone?): triggers off, light bar back to the game\n",fx_timeout_us/1000u);
++    fx_event(0,flags,result,begin,why);
++}
++static void *fx_thread(void *argument) {
++    (void)argument;
++    while (!atomic_load_explicit(&bye_done,memory_order_relaxed)) {
++        fd_set set;
++        FD_ZERO(&set);
++        FD_SET(sock,&set);
++        struct timeval timeout={0,FX_POLL_MS*1000};
++        const int ready=select((int)sock+1,&set,NULL,NULL,&timeout); /* the first argument is ignored on Windows */
++        if (atomic_load_explicit(&bye_done,memory_order_relaxed)) break;
++        if (ready>0) fx_receive();
++        else if (ready<0) sleep_ns((uint64_t)FX_POLL_MS*1000000u);
++        fx_tick();
++    }
++    return NULL;
++}
++/* Binds the event socket (to 127.0.0.1 for a loopback companion: nothing else on the network can
++ * reach the channel) before its first send, so the companion can answer to it. */
++static int fx_open(uint32_t ip) {
++    struct sockaddr_in local;
++    memset(&local,0,sizeof(local));
++    local.sin_family=AF_INET;
++    local.sin_addr.s_addr=htonl((ip>>24)==127u ? 0x7f000001u : INADDR_ANY);
++    local.sin_port=0;
++    if (bind(sock,(const struct sockaddr *)&local,(int)sizeof(local))) {
++        printf("Runtime: UNDS: fx: bind failed (%d); control channel off\n",socket_error());
++        return -1;
++    }
++    socklen_t length=sizeof(local);
++    if (getsockname(sock,(struct sockaddr *)&local,&length)) {
++        printf("Runtime: UNDS: fx: getsockname failed (%d); control channel off\n",socket_error());
++        return -1;
++    }
++#ifdef _WIN32
++    /* Without this, every ICMP "port unreachable" (a hello sent while no companion listens) would
++     * come back as WSAECONNRESET on the next recvfrom. */
++    BOOL report=FALSE; DWORD bytes=0;
++    WSAIoctl(sock,SIO_UDP_CONNRESET,&report,sizeof(report),NULL,0,&bytes,NULL,NULL);
++#endif
++    atomic_store(&fx_port,(int)ntohs(local.sin_port));
++    return 0;
++}
++/* At bye: the triggers off before the process goes (SDL's rumble thread gets 30 ms to write
++ * it), and no command is taken after that. */
++static void fx_shutdown(void) {
++    if (!atomic_load(&fx_on)) return;
++    pthread_mutex_lock(&fx_lock);
++    fx_closed=1;
++    const int held=atomic_load_explicit(&fx_held,memory_order_relaxed);
++    if (held) fx_release_locked();
++    pthread_mutex_unlock(&fx_lock);
++    if (held) sleep_ns(FX_BYE_FLUSH_NS);
++}
++int runtime_unds_fx_led_owned(void) { return atomic_load_explicit(&fx_led,memory_order_relaxed); }
++
+ void runtime_unds_start(uintptr_t image) {
+     const char *rumble=getenv("UNDS_RUMBLE");
+     if (rumble && !strcmp(rumble,"0")) {
+@@ -403,11 +622,24 @@ void runtime_unds_start(uintptr_t image) {
+     process_id=(unsigned long)getpid();
+ #endif
+     exe_names();
++    const char *fx=getenv("UNDS_FX");
++    const int want_fx=!(fx && !strcmp(fx,"0"));
++    if (want_fx && !fx_open(ip)) atomic_store(&fx_on,1);
+     atomic_store(&active,1);
+     printf("Runtime: UNDS: events to %u.%u.%u.%u:%u (protocol %d, %s, %s)\n",ip>>24,(ip>>16)&255u,(ip>>8)&255u,ip&255u,
+            port,UNDS_PROTOCOL,UNDS_VERSION,exe_id);
+-    send_hello(1);
+     pthread_t thread;
++    if (atomic_load(&fx_on)) {
++        if (pthread_create(&thread,NULL,fx_thread,NULL)) {
++            atomic_store(&fx_on,0);
++            puts("Runtime: UNDS: fx: no receiver thread (pthread_create failed); control channel off");
++        } else {
++            pthread_detach(thread);
++            printf("Runtime: UNDS: fx: control channel on UDP port %d (adaptive triggers and light bar through SDL; "
++                   "UNDS_FX=0 turns it off)\n",atomic_load(&fx_port));
++        }
++    } else if (!want_fx) puts("Runtime: UNDS: fx: control channel off (UNDS_FX=0)");
++    send_hello(1);
+     if (pthread_create(&thread,NULL,heartbeat,NULL)) puts("Runtime: UNDS: no heartbeat thread (pthread_create failed)");
+     else pthread_detach(thread);
+ }
+@@ -421,6 +653,7 @@ uint8_t runtime_unds_trigger_threshold(int right) {
+ void runtime_unds_bye(const char *reason) {
+     if (!atomic_load_explicit(&active,memory_order_relaxed)) return;
+     if (atomic_exchange(&bye_done,1)) return;
++    fx_shutdown(); /* triggers off while SDL is still there */
+     char clean[32]; size_t i=0;
+     for (;reason && reason[i] && i+1<sizeof(clean);++i)
+         clean[i]=(reason[i]>='a' && reason[i]<='z') || (reason[i]>='0' && reason[i]<='9') || reason[i]=='_' ? reason[i] : '_';
+@@ -862,4 +1095,9 @@ void runtime_unds_report(void) {
+            "longest sendto %" PRIu64 " us, sends over 1 ms=%" PRIu64 ", scePadSetVibration calls=%" PRIu64 "\n",
+            atomic_load(&sent),atomic_load(&dropped),atomic_load(&errors),atomic_load(&last_error),
+            atomic_load(&send_max_ns_total)/1000u,atomic_load(&slow_sends),atomic_load(&vibration_calls));
++    if (atomic_load(&fx_on))
++        printf("Runtime: UNDS fx: commands=%" PRIu64 ", rejected=%" PRIu64 ", SDL failures=%" PRIu64 ", rewritten after a "
++               "reconnect=%" PRIu64 ", watchdog releases=%" PRIu64 "\n",
++               atomic_load(&fx_commands),atomic_load(&fx_rejected),atomic_load(&fx_failures),atomic_load(&fx_reapplied),
++               atomic_load(&fx_timeouts));
+ }
+diff --git a/src/runtime_unds.h b/src/runtime_unds.h
+index d021560..d42fe51 100644
+--- a/src/runtime_unds.h
++++ b/src/runtime_unds.h
+@@ -12,8 +12,26 @@
+  *   UNDS_STATE=0                  no game-state callbacks (health, weapon, ammunition, damage;
+  *                                 on by default with UNDS_EVENTS, U1 1.00 only so far)
+  *   UNDS_STATE_DEBUG=1            the objects the game-state callbacks find, in the log
++ *   UNDS_FX=0                     no control channel (on by default with UNDS_EVENTS, see below)
+  * UNDS_RUMBLE, UNDS_LED and UNDS_TRIGGER work with or without UNDS_EVENTS.
+  *
++ * Control channel ("fx", companion -> port, on with UNDS_EVENTS unless UNDS_FX=0): the companion
++ * answers to the address the events come from with 37-byte binary datagrams that set the
++ * DualSense adaptive triggers and light bar; the port writes them with SDL_SendGamepadEffect, so
++ * SDL stays the only writer of the controller's output report (no hidapi in the companion, USB
++ * and Bluetooth alike). Only datagrams from the UNDS_EVENTS host are taken; the socket is bound
++ * to 127.0.0.1 when that host is loopback.
++ *   0 "UNDC"  4 version (1)  5 flags: 1 R2, 2 L2, 4 light bar, 8 release (both triggers off, the
++ *   light bar back to the game; the other bits are then ignored)  6-7 zero  8 seq (u32 LE)
++ *   12 R2 effect (11 bytes)  23 L2 effect (11 bytes)  34 r g b
++ * Trigger effects are the controller's own 11-byte blocks (mode byte first; modes 0x01 0x02 0x05
++ * 0x06 0x11 0x12 0x21 0x22 0x23 0x25 0x26 0x27 only). Only the trigger and light bar bits of the
++ * report are ever set: never rumble emulation (which turns the audio haptics off). While the
++ * companion holds the light bar, the game's scePadSetLightBar is published but not shown.
++ * Without a datagram for 5 s (the companion re-sends its state every 2 s), at "bye" and on
++ * "release", the triggers go off and the light bar goes back to the game; after a controller
++ * reconnects, the held state is written again. Every command gets an "fx" event back.
++ *
+  * Protocol v1: every datagram is one JSON object with
+  *   "v":1  "seq":<uint32, per process>  "t":<CLOCK_MONOTONIC us>  "e":"<event>"  ...fields
+  * Only integers are sent (no locale-dependent float formatting). See runtime_unds.c. */
+@@ -22,7 +40,33 @@
+ #include <stdint.h>
+ 
+ #define UNDS_PROTOCOL 1
+-#define UNDS_VERSION "0.4.1"
++#define UNDS_VERSION "0.5.0"
++
++/* Control datagram (see above). */
++#define UNDS_FX_SIZE 37
++#define UNDS_FX_RIGHT 0x01
++#define UNDS_FX_LEFT 0x02
++#define UNDS_FX_LED 0x04
++#define UNDS_FX_RELEASE 0x08
++/* SDL_hidapi_ps5.c DS5EffectsState_t (the USB report after its id): what runtime_pad_unds_effect takes. */
++#define UNDS_DS5_EFFECTS_SIZE 47
++#define UNDS_DS5_ENABLE1 0      /* 0x04 right trigger, 0x08 left trigger */
++#define UNDS_DS5_ENABLE2 1      /* 0x04 light bar colour */
++#define UNDS_DS5_RIGHT 10
++#define UNDS_DS5_LEFT 21
++#define UNDS_DS5_RGB 44
++
++/* runtime_pad.c, for the control channel (any thread; they take the pad lock themselves).
++ * runtime_pad_unds_effect writes one DS5EffectsState_t through SDL_SendGamepadEffect: 1 sent,
++ * 0 no controller yet (or the game has not opened the pad), -1 not a DualSense, -2 SDL refused
++ * (both logged once). runtime_pad_unds_generation counts controller connections (a change: the
++ * held effects must be written again). runtime_pad_unds_game_led puts the game's colour back
++ * through SDL (UNDS_LED=0 still wins). */
++int runtime_pad_unds_effect(const uint8_t *effects, int size);
++unsigned runtime_pad_unds_generation(void);
++void runtime_pad_unds_game_led(uint8_t r, uint8_t g, uint8_t b);
++/* 1 while the companion holds the light bar (set_led then leaves SDL alone). */
++int runtime_unds_fx_led_owned(void);
+ 
+ /* Reads UNDS_EVENTS / UNDS_RUMBLE / UNDS_LED / UNDS_TRIGGER; with UNDS_EVENTS, opens the socket, sends "hello" and starts
+  * the 1 s heartbeat. `image` is the guest image base. Silent when neither variable is set. */
+diff --git a/tests/test_unds.c b/tests/test_unds.c
+index 7bfabc6..ce177b6 100644
+--- a/tests/test_unds.c
++++ b/tests/test_unds.c
+@@ -1,14 +1,51 @@
+ /* UNDS event bus: endpoint parsing, change detection, pad rate limit, audio levels, protocol
+- * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER. Sends to a UDP socket of its own on 127.0.0.1.
++ * fields, seq continuity, "bye", UNDS_LED and UNDS_TRIGGER, and the fx control channel (reports
++ * handed to a stand-in of runtime_pad.c). Sends to a UDP socket of its own on 127.0.0.1.
+  * Linux:            cc -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c -lm -o out/unds-test
+  * MSYS2 CLANG64:    clang -std=c11 -Wall -Wextra -Werror -pthread -Isrc tests/test_unds.c src/compat_win.c -lws2_32 -lbcrypt -o out/unds-test.exe */
+ #include "../src/runtime_unds.c"
+ #undef NDEBUG /* the checks below have side effects */
+ #include <assert.h>
+ #include <ctype.h>
++#include <signal.h>
+ 
+ static unds_socket_t rx=UNDS_INVALID_SOCKET;
+-static uint32_t expect_seq;
++/* seq: every datagram exactly once. Three threads send (the caller, the heartbeat, the fx
++ * receiver) and each takes its seq before its sendto, so two sends at the same moment can arrive
++ * swapped: the order is not checked, losses and repeats are (check_no_gaps at the end). */
++static uint8_t seen_seq[8192];
++static uint32_t max_seq, reordered;
++static size_t longest_datagram;
++static void note_seq(const char *json);
++
++/* runtime_pad.c stand-ins: the DS5EffectsState_t reports the control channel hands to SDL. */
++static pthread_mutex_t pad_stub=PTHREAD_MUTEX_INITIALIZER;
++static uint8_t pad_report[UNDS_DS5_EFFECTS_SIZE], game_led_rgb[3];
++static int pad_reports, pad_result=1, game_led_calls;
++static unsigned pad_generation;
++int runtime_pad_unds_effect(const uint8_t *effects, int size) {
++    assert(size==UNDS_DS5_EFFECTS_SIZE);
++    pthread_mutex_lock(&pad_stub);
++    memcpy(pad_report,effects,sizeof(pad_report)); ++pad_reports;
++    const int result=pad_result;
++    pthread_mutex_unlock(&pad_stub);
++    return result;
++}
++unsigned runtime_pad_unds_generation(void) {
++    pthread_mutex_lock(&pad_stub);
++    const unsigned generation=pad_generation;
++    pthread_mutex_unlock(&pad_stub);
++    return generation;
++}
++void runtime_pad_unds_game_led(uint8_t r, uint8_t g, uint8_t b) {
++    pthread_mutex_lock(&pad_stub);
++    game_led_rgb[0]=r; game_led_rgb[1]=g; game_led_rgb[2]=b; ++game_led_calls;
++    pthread_mutex_unlock(&pad_stub);
++}
++static int reports(void) { pthread_mutex_lock(&pad_stub); const int n=pad_reports; pthread_mutex_unlock(&pad_stub); return n; }
++static void last_report(uint8_t out[UNDS_DS5_EFFECTS_SIZE]) {
++    pthread_mutex_lock(&pad_stub); memcpy(out,pad_report,UNDS_DS5_EFFECTS_SIZE); pthread_mutex_unlock(&pad_stub);
++}
+ 
+ static void open_receiver(char *endpoint, size_t size) {
+ #ifdef _WIN32
+@@ -28,8 +65,12 @@ static int receive(char *out, size_t size, int ms) {
+     fd_set set; FD_ZERO(&set); FD_SET(rx,&set);
+     struct timeval timeout={ms/1000,(ms%1000)*1000};
+     if (select((int)rx+1,&set,NULL,NULL,&timeout)<=0) return 0;
+-    int n=(int)recv(rx,out,(int)size-1,0);
++    static char buffer[4096]; /* Windows refuses a datagram longer than the buffer (WSAEMSGSIZE) */
++    int n=(int)recv(rx,buffer,(int)sizeof(buffer),0);
+     assert(n>0);
++    if ((size_t)n>longest_datagram) longest_datagram=(size_t)n;
++    assert((size_t)n<size && "datagram longer than the test's buffer");
++    memcpy(out,buffer,(size_t)n);
+     out[n]=0;
+     return 1;
+ }
+@@ -40,20 +81,39 @@ static long long field(const char *json, const char *key) {
+     return strtoll(at+strlen(pattern),NULL,10);
+ }
+ static int has(const char *json, const char *text) { return strstr(json,text)!=NULL; }
++static void note_seq(const char *json) {
++    const long long seq=field(json,"seq");
++    assert(seq>=0 && seq<(long long)sizeof(seen_seq));
++    if (seen_seq[seq]) { printf("unds-test: seq %lld twice\n",seq); assert(0 && "repeated seq"); }
++    seen_seq[seq]=1;
++    if ((uint32_t)seq<max_seq) ++reordered;
++    else max_seq=(uint32_t)seq;
++}
++static void check_no_gaps(void) {
++    for (uint32_t s=0;s<=max_seq;++s)
++        if (!seen_seq[s]) { printf("unds-test: datagram seq %u never arrived (last seq %u)\n",s,max_seq); assert(0 && "lost datagram"); }
++}
+ /* Next datagram that is not a heartbeat (hello, refreshes); checks v and seq continuity. */
++/* The last datagram next_event saw: printed when an assertion fails (SIGABRT). */
++static char last_event[1024]="(none)";
++static void print_last_event(int signal_number) {
++    (void)signal_number;
++    fprintf(stderr,"unds-test: last datagram seen: %s\n",last_event);
++    fflush(stderr);
++}
+ static int next_event(char *out, size_t size, int ms) {
+     for (;;) {
+-        if (!receive(out,size,ms)) return 0;
++        if (!receive(out,size,ms)) { snprintf(last_event,sizeof(last_event),"(none within %d ms)",ms); return 0; }
++        snprintf(last_event,sizeof(last_event),"%s",out);
+         assert(field(out,"v")==1);
+-        assert((uint32_t)field(out,"seq")==expect_seq);
+-        ++expect_seq;
++        note_seq(out);
+         if (has(out,"\"e\":\"hello\"") || has(out,"\"re\":1")) continue;
+         return 1;
+     }
+ }
+ static void no_event(int ms) {
+     char text[512];
+-    assert(!next_event(text,sizeof(text),ms));
++    if (next_event(text,sizeof(text),ms)) { printf("unds-test: unexpected datagram: %s\n",text); fflush(stdout); assert(0 && "no event expected"); }
+ }
+ static void set_env(const char *name, const char *value) {
+ #ifdef _WIN32
+@@ -229,7 +289,123 @@ static void test_state(void) {
+     assert(!peek(0x10,&byte,1) && !peek(UINTPTR_MAX-2,&byte,8));
+ }
+ 
++/* The control channel: datagrams from `from` to the port's fx socket. */
++static void fx_send(unds_socket_t from, int port, int flags, uint32_t command, const uint8_t *right, const uint8_t *left,
++                    const uint8_t *rgb, size_t size, uint8_t version) {
++    uint8_t d[64]; memset(d,0,sizeof(d));
++    memcpy(d,"UNDC",4); d[4]=version; d[5]=(uint8_t)flags;
++    d[8]=(uint8_t)command; d[9]=(uint8_t)(command>>8); d[10]=(uint8_t)(command>>16); d[11]=(uint8_t)(command>>24);
++    if (right) memcpy(d+12,right,11);
++    if (left) memcpy(d+23,left,11);
++    if (rgb) memcpy(d+34,rgb,3);
++    struct sockaddr_in to; memset(&to,0,sizeof(to));
++    to.sin_family=AF_INET; to.sin_addr.s_addr=htonl(0x7f000001u); to.sin_port=htons((uint16_t)port);
++    assert(sendto(from,(const char *)d,(int)size,0,(const struct sockaddr *)&to,(int)sizeof(to))==(int)size);
++}
++static void fx_cmd(int port, int flags, uint32_t command, const uint8_t *right, const uint8_t *left, const uint8_t *rgb) {
++    fx_send(rx,port,flags,command,right,left,rgb,UNDS_FX_SIZE,1);
++}
++/* The fx event answering command `command`. */
++static void fx_ack(char *e, size_t size, uint32_t command, int flags, int ok, const char *why) {
++    assert(next_event(e,size,500) && has(e,"\"e\":\"fx\""));
++    char text[32]; snprintf(text,sizeof(text),"\"why\":\"%s\"",why);
++    assert((uint32_t)field(e,"c")==command && field(e,"f")==flags && field(e,"ok")==ok && has(e,text));
++    assert(field(e,"q")>=0 && field(e,"q")<100000);
++}
++static void test_fx(int port) {
++    char e[512];
++    uint8_t r[UNDS_DS5_EFFECTS_SIZE];
++    /* WEAPON 3 4 8 and FEEDBACK 4 1 as unds_hid.py encodes them */
++    const uint8_t weapon[11]={0x25,0x18,0x00,0x07}, feedback[11]={0x21,0xf0,0x03}, rgb[3]={128,128,0};
++    assert(atomic_load(&fx_on) && port>0 && !runtime_unds_fx_led_owned());
++    /* R2 alone: enable bit 0x04 of the first byte, the effect at offset 10, nothing else */
++    fx_cmd(port,UNDS_FX_RIGHT,1,weapon,NULL,NULL);
++    fx_ack(e,sizeof(e),1,UNDS_FX_RIGHT,1,"cmd");
++    last_report(r);
++    assert(reports()==1 && r[0]==0x04 && r[1]==0 && !memcmp(r+10,weapon,11) && r[21]==0 && r[44]==0);
++    assert(atomic_load(&fx_held)==UNDS_FX_RIGHT);
++    /* L2 and the light bar in one report; the companion holds the light bar from now on */
++    fx_cmd(port,UNDS_FX_LEFT|UNDS_FX_LED,2,NULL,feedback,rgb);
++    fx_ack(e,sizeof(e),2,UNDS_FX_LEFT|UNDS_FX_LED,1,"cmd");
++    last_report(r);
++    assert(reports()==2 && r[0]==0x08 && r[1]==0x04 && !memcmp(r+21,feedback,11) && r[10]==0 && !memcmp(r+44,rgb,3));
++    assert(runtime_unds_fx_led_owned() && atomic_load(&fx_held)==(UNDS_FX_RIGHT|UNDS_FX_LEFT|UNDS_FX_LED));
++    /* never the rumble-emulation bits (they turn the audio haptics off) */
++    assert(!(r[0]&0x03));
++    /* the game's colour is still published (the companion builds its light bar from it) */
++    runtime_unds_led(64,0,0);
++    assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"led\"") && field(e,"r")==64);
++    /* rejected: an unknown trigger mode, a short datagram, another version, another host */
++    const uint8_t bogus[11]={0x99};
++    fx_cmd(port,UNDS_FX_RIGHT,3,bogus,NULL,NULL);
++    fx_send(rx,port,UNDS_FX_RIGHT,4,weapon,NULL,NULL,UNDS_FX_SIZE-1,1);
++    fx_send(rx,port,UNDS_FX_RIGHT,5,weapon,NULL,NULL,UNDS_FX_SIZE,2);
++    unds_socket_t stranger=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
++    struct sockaddr_in a; memset(&a,0,sizeof(a));
++    a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(0x7f000002u);
++    int strangers=0;
++    if (stranger!=UNDS_INVALID_SOCKET && !bind(stranger,(struct sockaddr *)&a,sizeof(a))) {
++        /* only where the source address survives (Wine reports 127.0.0.2 as 127.0.0.1) */
++        struct sockaddr_in me, from; socklen_t length=sizeof(me);
++        assert(!getsockname(rx,(struct sockaddr *)&me,&length));
++        assert(sendto(stranger,"probe",5,0,(const struct sockaddr *)&me,(int)sizeof(me))==5);
++        fd_set set; FD_ZERO(&set); FD_SET(rx,&set);
++        struct timeval timeout={0,500000};
++        assert(select((int)rx+1,&set,NULL,NULL,&timeout)==1);
++        char probe[16]; length=sizeof(from);
++        assert(recvfrom(rx,probe,(int)sizeof(probe),0,(struct sockaddr *)&from,&length)==5);
++        if (from.sin_addr.s_addr==a.sin_addr.s_addr) {
++            fx_send(stranger,port,UNDS_FX_RIGHT,6,weapon,NULL,NULL,UNDS_FX_SIZE,1);
++            strangers=1;
++        } else puts("unds-test: this system reports 127.0.0.2 as another address, the source check is not exercised");
++    } else puts("unds-test: no 127.0.0.2 here, the source check is not exercised");
++    no_event(150);
++    assert(reports()==2 && atomic_load(&fx_rejected)==(uint64_t)(3+strangers));
++    /* a keep-alive (no part): answered, nothing written */
++    fx_cmd(port,0,7,NULL,NULL,NULL);
++    fx_ack(e,sizeof(e),7,0,1,"cmd");
++    assert(reports()==2);
++    /* the controller reconnected: everything held, in one report */
++    pthread_mutex_lock(&pad_stub); ++pad_generation; pthread_mutex_unlock(&pad_stub);
++    fx_ack(e,sizeof(e),0,UNDS_FX_RIGHT|UNDS_FX_LEFT|UNDS_FX_LED,1,"reconnect");
++    last_report(r);
++    assert(reports()==3 && r[0]==0x0c && r[1]==0x04 && !memcmp(r+10,weapon,11) && !memcmp(r+21,feedback,11) && !memcmp(r+44,rgb,3));
++    /* not a DualSense: the result is answered and counted */
++    pthread_mutex_lock(&pad_stub); pad_result=-1; pthread_mutex_unlock(&pad_stub);
++    fx_cmd(port,UNDS_FX_RIGHT,8,weapon,NULL,NULL);
++    fx_ack(e,sizeof(e),8,UNDS_FX_RIGHT,-1,"cmd");
++    assert(atomic_load(&fx_failures)==1);
++    pthread_mutex_lock(&pad_stub); pad_result=1; pthread_mutex_unlock(&pad_stub);
++    /* release: both triggers off and the game's colour back (SDL may show it: UNDS_LED not 0) */
++    atomic_store(&led_on,1);
++    fx_cmd(port,UNDS_FX_RELEASE|UNDS_FX_RIGHT,9,weapon,NULL,NULL);   /* the other bits are ignored */
++    fx_ack(e,sizeof(e),9,UNDS_FX_RELEASE|UNDS_FX_RIGHT,1,"release");
++    last_report(r);
++    assert(r[0]==0x0c && r[10]==0x05 && r[21]==0x05 && r[1]==0x04 && r[44]==64 && r[45]==0 && r[46]==0);
++    assert(game_led_calls==1 && game_led_rgb[0]==64 && !runtime_unds_fx_led_owned() && !atomic_load(&fx_held));
++    /* watchdog: held state and no datagram for fx_timeout_us -> triggers off (the light bar was not held) */
++    fx_timeout_us=300000u;
++    fx_cmd(port,UNDS_FX_RIGHT,10,weapon,NULL,NULL);
++    fx_ack(e,sizeof(e),10,UNDS_FX_RIGHT,1,"cmd");
++    const int before=reports();
++    assert(next_event(e,sizeof(e),900) && has(e,"\"e\":\"fx\"") && has(e,"\"why\":\"timeout\"") && field(e,"f")==UNDS_FX_RELEASE);
++    last_report(r);
++    assert(reports()==before+1 && r[0]==0x0c && r[10]==0x05 && r[21]==0x05 && r[1]==0 && game_led_calls==1);
++    assert(atomic_load(&fx_timeouts)==1 && !atomic_load(&fx_held));
++    no_event(400); /* nothing held: the watchdog stays quiet */
++    fx_timeout_us=5000000u;
++    /* held again for the bye test in main() */
++    fx_cmd(port,UNDS_FX_RIGHT,11,weapon,NULL,NULL);
++    fx_ack(e,sizeof(e),11,UNDS_FX_RIGHT,1,"cmd");
++#ifdef _WIN32
++    if (stranger!=UNDS_INVALID_SOCKET) closesocket(stranger);
++#else
++    if (stranger!=UNDS_INVALID_SOCKET) close(stranger);
++#endif
++}
++
+ int main(void) {
++    signal(SIGABRT,print_last_event);
+     test_parse();
+     test_thresholds();
+     set_env("BB_EXE","big2-ps4_Shipping.elf");
+@@ -265,7 +441,9 @@ int main(void) {
+     assert(receive(e,sizeof(e),500) && has(e,"\"e\":\"hello\"") && field(e,"seq")==0 && field(e,"boot")==1);
+     assert(has(e,"\"exe\":\"u2\"") && has(e,"\"bin\":\"big2-ps4_Shipping.elf\"") && has(e,"\"base\":\"0xb400000\""));
+     assert(field(e,"rumble")==0 && field(e,"led")==0 && has(e,"\"trig\":\"40,140\"") && field(e,"pid")>0);
+-    expect_seq=1;
++    assert(field(e,"fx")==1 && field(e,"fxp")>0 && field(e,"fxc")==0 && field(e,"fxo")==0);
++    const int fx_udp=(int)field(e,"fxp");
++    note_seq(e);
+ 
+     /* rumble and LED: only changes */
+     runtime_unds_rumble(10,20);
+@@ -285,11 +463,21 @@ int main(void) {
+     no_event(30);
+     runtime_unds_pad(0,128,128,128,128,0,0,0,60);            /* R2 travel under the threshold: a change */
+     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0 && field(e,"r2a")==60 && field(e,"l2a")==0);
++    const uint64_t pressed_us=now_us();
+     runtime_unds_pad(0x200,128,128,128,128,0,255,0,150);     /* R2 pressed: sent at once */
+-    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
+     runtime_unds_pad(0x200,128,128,128,128,0,200,0,150);     /* analog only, <8 ms later: held */
+     runtime_unds_pad(0x200,128,128,128,128,0,180,0,170);
+-    assert(next_event(e,sizeof(e),400) && field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
++    const uint64_t held_us=now_us()-pressed_us;
++    assert(next_event(e,sizeof(e),500) && field(e,"b")==0x200 && field(e,"r2")==255 && field(e,"r2a")==150);
++    /* The newest analog state comes with the heartbeat. Only if this thread was held up for 8 ms
++     * or more between the calls (a busy Windows PC) may the middle one have gone out at once. */
++    assert(next_event(e,sizeof(e),400) && has(e,"\"e\":\"pad\""));
++    if (field(e,"r2")==200) {
++        printf("unds-test: the pad calls took %" PRIu64 " us: the middle state went out at once\n",held_us);
++        assert(held_us>=PAD_MIN_INTERVAL_US && "an analog change inside 8 ms was not held back");
++        assert(next_event(e,sizeof(e),400) && has(e,"\"e\":\"pad\""));
++    }
++    assert(field(e,"r2")==180 && field(e,"r2a")==170); /* sent by the heartbeat */
+     runtime_unds_pad(0,128,128,128,128,0,0,0,0);             /* release: at once */
+     assert(next_event(e,sizeof(e),500) && field(e,"b")==0 && field(e,"r2")==0);
+ 
+@@ -303,7 +491,7 @@ int main(void) {
+     int hello=0, refresh=0, state_refresh=0;
+     for (int i=0;i<40 && (!hello || !refresh || !state_refresh);++i) {
+         if (!receive(e,sizeof(e),100)) continue;
+-        assert((uint32_t)field(e,"seq")==expect_seq); ++expect_seq;
++        note_seq(e);
+         if (has(e,"\"e\":\"hello\"")) {
+             hello=1;
+             assert(field(e,"boot")==0 && field(e,"sent")>0 && has(e,"\"ports\":\"0:0:8:1024,17:4:1:256\""));
+@@ -314,14 +502,29 @@ int main(void) {
+     }
+     assert(hello && refresh && state_refresh);
+ 
++    test_fx(fx_udp);
++    /* bye with R2 held: the triggers go off before the bye, and nothing is taken after it */
++    const int before_bye=reports();
+     runtime_unds_bye("loadexec");
++    uint8_t r[UNDS_DS5_EFFECTS_SIZE];
++    last_report(r);
++    assert(reports()==before_bye+1 && r[0]==0x0c && r[10]==0x05 && r[21]==0x05);
+     assert(next_event(e,sizeof(e),500) && has(e,"\"e\":\"bye\"") && has(e,"\"reason\":\"loadexec\""));
++    const uint8_t weapon[11]={0x25,0x18,0x00,0x07};
++    fx_cmd(fx_udp,UNDS_FX_RIGHT,12,weapon,NULL,NULL);
+     runtime_unds_bye("again");
+     runtime_unds_rumble(1,1);
+     char extra[512];
+-    assert(!receive(extra,sizeof(extra),600)); /* nothing after bye, not even the heartbeat */
++    assert(!receive(extra,sizeof(extra),600)); /* nothing after bye, not even the heartbeat or an fx answer */
++    assert(reports()==before_bye+1);
+     runtime_unds_report();
+     assert(!atomic_load(&errors) && !atomic_load(&dropped));
++    /* No send may wait on another thread (the fx receiver sits in select() on the same socket). */
++    const uint64_t longest=atomic_load(&send_max_ns_total);
++    printf("unds-test: longest sendto %" PRIu64 " us\n",longest/1000u);
++    assert(longest<250000000u && "a sendto waited 250 ms or more");
++    check_no_gaps();
++    printf("unds-test: %u datagrams, %u arrived ahead of an earlier one, longest %zu bytes\n",max_seq+1,reordered,longest_datagram);
+     puts("unds-test: ok");
+     return 0;
+ }
+-- 
+2.34.1
+

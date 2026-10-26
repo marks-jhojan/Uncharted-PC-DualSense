@@ -1,0 +1,205 @@
+From b896d48fdb79e8a59a7220b056d62f522ee19d6f Mon Sep 17 00:00:00 2001
+From: marks-jhojan <153632015+marks-jhojan@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:31:56 +0000
+Subject: [PATCH 8/8] run.py: start the UNDS DualSense companion with the game
+ when it is installed
+
+UNDS (adaptive triggers, light bar and haptics for the DualSense) ships
+its companion as UNDS/UNDS.exe beside the port. Starting it by hand, or
+through a launcher of its own, left out every other way into the game:
+the launcher's Play, its desktop and Steam shortcuts (--play). All of
+them go through run.py, so the companion starts here:
+
+- `UNDS.exe --env` names the variables it wants (UNDS_EVENTS, ...), or
+  exits with 1 when the player turned it off in unds_launcher.ini; they
+  never override what the player set (the launcher's Environment field).
+- `UNDS.exe --attach <pid> --game <port> --log <user>/last_run.log`
+  runs in its own minimized console (the game keeps the focus) or, with
+  UNDS_WINDOW=hidden, without a window (it writes its own log, and its
+  output stays out of this script's, which the launcher reads), and ends
+  by itself when this process does, also across executable switches of
+  the collection, which happen inside this process.
+- Nothing happens without UNDS/UNDS.exe, with UNDS_AUTO=0, or when
+  UNDS_EVENTS was already set by someone else running a companion. An
+  "Apply and restart" (a new run.py with this one's environment) starts
+  a companion of its own: UNDS_AUTO_STARTED marks the inherited value.
+
+tests/test_run_companion.py covers these cases with stand-ins for the
+Windows-only subprocess pieces.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JjXy3Jjs4Eb5CW4ouhg3nL
+---
+ run.py                      | 49 ++++++++++++++++++++
+ tests/test_run_companion.py | 92 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 141 insertions(+)
+ create mode 100644 tests/test_run_companion.py
+
+diff --git a/run.py b/run.py
+index a9211d3..9834323 100644
+--- a/run.py
++++ b/run.py
+@@ -44,6 +44,54 @@ def no_console():
+     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
+ 
+ 
++def start_companion(env, user_dir):
++    """A DualSense companion (UNDS: adaptive triggers, light bar and haptics) shipped in UNDS/ beside
++    the port starts with the game, whichever way the game is started (launcher, --play shortcuts).
++
++    `UNDS.exe --env` prints the variables it wants (NAME=value lines; exit code 1 = turned off in its
++    unds_launcher.ini); they do not override what the player set. UNDS_WINDOW (not passed on) says how
++    the companion runs: console (default: its own minimized console) or hidden (no window at all, it
++    writes its own log). It ends by itself when this process does. Nothing happens without UNDS/UNDS.exe,
++    with UNDS_AUTO=0, or when UNDS_EVENTS is already set by someone else who runs a companion (not by an
++    earlier run of this script: "Apply and restart" starts a new one for the new process)."""
++    companion = PORT / 'UNDS' / 'UNDS.exe'
++    external = env.get('UNDS_EVENTS') and env.get('UNDS_AUTO_STARTED') != '1'
++    if os.name != 'nt' or not companion.is_file() or external or env.get('UNDS_AUTO') == '0':
++        return
++    try:
++        query = subprocess.run([str(companion), '--env'], capture_output=True, text=True, timeout=30,
++                               stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
++    except (OSError, subprocess.SubprocessError) as error:
++        print(f'UNDS: {companion} did not answer ({error}); playing without it')
++        return
++    if query.returncode:
++        return
++    wanted = dict(line.split('=', 1) for line in query.stdout.splitlines() if line.startswith('UNDS_') and '=' in line)
++    if not wanted.get('UNDS_EVENTS'):
++        return
++    window = wanted.pop('UNDS_WINDOW', 'console').strip().lower()
++    for key, value in wanted.items():
++        env.setdefault(key.strip(), value.strip())
++    env['UNDS_AUTO_STARTED'] = '1'
++    # Never this script's own output handles: the launcher reads them into last_run.log (and would wait
++    # for the companion to close them).
++    if window != 'hidden':
++        startup = subprocess.STARTUPINFO()
++        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
++        startup.wShowWindow = 7  # SW_SHOWMINNOACTIVE: a console in the taskbar, the game keeps the focus
++        # No std handles given: the companion uses those of its new console.
++        options = {'startupinfo': startup, 'creationflags': subprocess.CREATE_NEW_CONSOLE}
++    else:
++        options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
++                   'creationflags': subprocess.CREATE_NO_WINDOW}
++    try:
++        subprocess.Popen([str(companion), '--attach', str(os.getpid()), '--game', str(PORT),
++                          '--log', str(user_dir / 'last_run.log')], cwd=companion.parent, env=env, **options)
++        print(f'UNDS: companion started ({env["UNDS_EVENTS"]})')
++    except OSError as error:
++        print(f'UNDS: could not start {companion}: {error}')
++
++
+ def run_script(name, *args):
+     # Inside the packaged executable (PyInstaller) the executable runs scripts itself.
+     script = ['--script'] if getattr(sys, 'frozen', False) else []
+@@ -209,6 +257,7 @@ def main():
+     player_tiny = env.get('BB_TINY_READBACK')
+     player_copy = env.get('BB_SCALAR_COPY64_SYNC')
+     all_cheats = env.setdefault('BB_CHEATS_ALL', env.get('BB_CHEATS', ''))
++    start_companion(env, user_dir)
+     while True:
+         if player_merge is None:
+             if exe == EXECUTABLES['u2']:
+diff --git a/tests/test_run_companion.py b/tests/test_run_companion.py
+new file mode 100644
+index 0000000..50054c4
+--- /dev/null
++++ b/tests/test_run_companion.py
+@@ -0,0 +1,92 @@
++"""run.py start_companion(): when UNDS/UNDS.exe is beside the port it starts with the game (stand-ins for
++the Windows-only subprocess pieces, so this runs anywhere)."""
++from paths import ROOT
++import os
++import sys
++import tempfile
++import types
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(ROOT))
++import run  # noqa: E402
++
++
++class FakeSubprocess:
++    CREATE_NO_WINDOW, CREATE_NEW_CONSOLE, STARTF_USESHOWWINDOW = 0x08000000, 0x10, 1
++    SubprocessError, DEVNULL = Exception, -3
++
++    class STARTUPINFO:
++        def __init__(self):
++            self.dwFlags = self.wShowWindow = 0
++
++    def __init__(self, out, code=0):
++        self.out, self.code, self.queries, self.started = out, code, [], []
++
++    def run(self, command, **kwargs):
++        self.queries.append(command)
++        return types.SimpleNamespace(returncode=self.code, stdout=self.out)
++
++    def Popen(self, command, **kwargs):
++        self.started.append((command, kwargs))
++
++
++class StartCompanionTests(unittest.TestCase):
++    def setUp(self):
++        self.port = Path(tempfile.mkdtemp())
++        (self.port / 'UNDS').mkdir()
++        (self.port / 'UNDS' / 'UNDS.exe').write_bytes(b'')
++        self.saved = run.PORT, run.subprocess, run.os.name
++        run.PORT, run.os.name = self.port, 'nt'
++
++    def tearDown(self):
++        run.PORT, run.subprocess, run.os.name = self.saved
++
++    def start(self, env, out='UNDS_EVENTS=127.0.0.1:47111\nUNDS_TRIGGER=30,95\nnoise\nOTHER=1\n', code=0):
++        run.subprocess = FakeSubprocess(out, code)
++        run.start_companion(env, self.port / 'user')
++        return run.subprocess
++
++    def test_starts_attached_without_overriding_the_player(self):
++        env = {'UNDS_TRIGGER': '30,78'}
++        fake = self.start(env)
++        self.assertEqual((env['UNDS_EVENTS'], env['UNDS_TRIGGER'], env['UNDS_AUTO_STARTED']),
++                         ('127.0.0.1:47111', '30,78', '1'))
++        self.assertNotIn('OTHER', env)
++        command, kwargs = fake.started[0]
++        self.assertEqual(command[1:3], ['--attach', str(os.getpid())])
++        self.assertEqual(command[command.index('--log') + 1], str(self.port / 'user' / 'last_run.log'))
++        self.assertEqual((kwargs['creationflags'], kwargs['startupinfo'].wShowWindow),
++                         (FakeSubprocess.CREATE_NEW_CONSOLE, 7))       # minimized console by default
++        # its own console's handles, never run.py's (a pipe the launcher reads into last_run.log)
++        self.assertFalse({'stdin', 'stdout', 'stderr'} & set(kwargs))
++
++    def test_hidden_when_asked(self):
++        env = {}
++        fake = self.start(env, out='UNDS_EVENTS=127.0.0.1:47111\nUNDS_WINDOW=hidden\n')
++        _command, kwargs = fake.started[0]
++        self.assertEqual((kwargs['creationflags'], kwargs['stdout']), (FakeSubprocess.CREATE_NO_WINDOW, FakeSubprocess.DEVNULL))
++        self.assertNotIn('UNDS_WINDOW', env)
++
++    def test_someone_else_runs_a_companion(self):
++        fake = self.start({'UNDS_EVENTS': '127.0.0.1:47111'})
++        self.assertEqual((fake.queries, fake.started), ([], []))
++
++    def test_apply_and_restart_starts_a_new_one(self):
++        fake = self.start({'UNDS_EVENTS': '127.0.0.1:47111', 'UNDS_AUTO_STARTED': '1'})
++        self.assertEqual(len(fake.started), 1)
++
++    def test_turned_off(self):
++        env = {}
++        fake = self.start(env, out='', code=1)
++        self.assertEqual((fake.started, env), ([], {}))
++        fake = self.start({'UNDS_AUTO': '0'})
++        self.assertEqual(fake.queries, [])
++
++    def test_without_unds(self):
++        (self.port / 'UNDS' / 'UNDS.exe').unlink()
++        self.assertEqual(self.start({}).queries, [])
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.34.1
+
